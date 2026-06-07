@@ -27,6 +27,7 @@ Commands: /play /pause /resume /skip /stop /queue /nowplaying /volume
 
 from __future__ import annotations
 
+import os  # Đảm bảo đã có dòng import os ở đầu file nhé bạn
 import asyncio
 import functools
 import re
@@ -66,10 +67,13 @@ YTDL_OPTIONS: dict[str, Any] = {
     "quiet"           : True,
     "no_warnings"     : True,
 
-    # Không dùng cookiefile hay oauth2 ở đây nữa để tránh lỗi 400 khi tìm kiếm
+    # Sử dụng đường dẫn tuyệt đối để Render không bao giờ bị lạc file cookie
+    "cookiefile"      : os.path.join(os.getcwd(), "cookies.txt"),
+
     "extractor_args": {
         "youtube": {
-            "player_client": ["tvhtml5", "android"]
+            # Cặp client chuyên trị lỗi "Sign in to confirm you're not a bot"
+            "player_client": ["android_embed", "web_embedded"]
         }
     }
 }
