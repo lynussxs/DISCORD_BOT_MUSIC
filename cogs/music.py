@@ -60,17 +60,21 @@ COLOUR_SUCCESS = 0x57F287   # mint
 #                 non-URL strings so the intent is always unambiguous.
 #
 YTDL_OPTIONS: dict[str, Any] = {
-    "format"          : "bestaudio[ext=webm]/bestaudio/best",
+    "format"          : "bestaudio/best",
     "default_search"  : "ytsearch",
     "noplaylist"      : True,
     "quiet"           : True,
     "no_warnings"     : True,
-    "source_address"  : "0.0.0.0",
-    "cookiefile": "cookies.txt",
+    # Xóa bỏ hoàn toàn "source_address": "0.0.0.0" để hệ thống tự linh hoạt dùng IPv6 nếu có
+
+    # Kích hoạt tính năng OAuth2 xác thực tài khoản trực tiếp
+    "username": "oauth2",
+    "password": "",
 
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"]
+            # Sử dụng các client của TV/Nhúng để né cơ chế quét của Web thông thường
+            "player_client": ["tv", "ios"]
         }
     }
 }
