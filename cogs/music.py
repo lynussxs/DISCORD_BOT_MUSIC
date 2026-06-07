@@ -66,6 +66,12 @@ YTDL_OPTIONS: dict[str, Any] = {
     "quiet"           : True,
     "no_warnings"     : True,
     "source_address"  : "0.0.0.0",
+
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"]
+        }
+    }
 }
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 
