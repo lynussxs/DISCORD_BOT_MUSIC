@@ -60,17 +60,21 @@ COLOUR_SUCCESS = 0x57F287   # mint
 #                 non-URL strings so the intent is always unambiguous.
 #
 YTDL_OPTIONS: dict[str, Any] = {
-    "format": "bestaudio/best/worst",
+    "format"          : "bestaudio/best",
     "default_search"  : "ytsearch",
     "noplaylist"      : True,
     "quiet"           : True,
     "no_warnings"     : True,
-    "cookiefile"      : "cookies.txt",
 
+    # Bật tính năng đăng nhập thiết bị qua OAuth2 mã hóa mới
+    "username": "oauth2",
+    "password": "",
+
+    # Ép yt-dlp sử dụng các luồng tải an toàn nhất
     "extractor_args": {
         "youtube": {
-            # Thử đổi sang cụm client lì đòn này:
-            "player_client": ["android_embed", "web_embedded"]
+            "player_client": ["tv"],
+            "skip": ["webpage", "hls"]
         }
     }
 }
