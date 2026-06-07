@@ -66,15 +66,10 @@ YTDL_OPTIONS: dict[str, Any] = {
     "quiet"           : True,
     "no_warnings"     : True,
 
-    # Bật tính năng đăng nhập thiết bị qua OAuth2 mã hóa mới
-    "username": "oauth2",
-    "password": "",
-
-    # Ép yt-dlp sử dụng các luồng tải an toàn nhất
+    # Không dùng cookiefile hay oauth2 ở đây nữa để tránh lỗi 400 khi tìm kiếm
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv"],
-            "skip": ["webpage", "hls"]
+            "player_client": ["tvhtml5", "android"]
         }
     }
 }
