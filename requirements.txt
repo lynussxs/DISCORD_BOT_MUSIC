@@ -1,0 +1,25 @@
+# Discord bot framework — voice extra pulls in PyNaCl + davey for encryption
+discord.py[voice]>=2.3.2
+
+# davey is discord.py's low-level voice helper (installed automatically with [voice])
+# Listed explicitly so `pip install -r requirements.txt` always gets it
+davey>=0.1.5
+
+# PyNaCl — cryptographic library required for voice connections
+PyNaCl>=1.5.0
+
+# YouTube audio extraction and streaming
+yt-dlp>=2024.1.0
+
+# Loads .env files into os.environ
+python-dotenv>=1.0.0
+
+# Lightweight web server used by keep_alive() so external ping services
+# (e.g. UptimeRobot) can hit an HTTP endpoint and keep the bot process alive.
+flask>=3.0.0
+
+# ── System dependency (install separately) ────────────────────────────────────
+# FFmpeg is required for audio processing.
+# Linux:  sudo apt install ffmpeg
+# macOS:  brew install ffmpeg
+# Replit: already installed as a system dependency
