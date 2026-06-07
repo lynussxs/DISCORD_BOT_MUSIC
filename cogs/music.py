@@ -61,19 +61,17 @@ COLOUR_SUCCESS = 0x57F287   # mint
 #                 non-URL strings so the intent is always unambiguous.
 #
 YTDL_OPTIONS: dict[str, Any] = {
-    "format"          : "bestaudio/best",
+    "format"          : "ba/ba*",  # Sửa ở đây
     "default_search"  : "ytsearch",
     "noplaylist"      : True,
     "quiet"           : True,
     "no_warnings"     : True,
-
-    # Sử dụng đường dẫn tuyệt đối để Render không bao giờ bị lạc file cookie
     "cookiefile"      : os.path.join(os.getcwd(), "cookies.txt"),
 
     "extractor_args": {
         "youtube": {
-            # Cặp client chuyên trị lỗi "Sign in to confirm you're not a bot"
-            "player_client": ["android_embed", "web_embedded"]
+            # Dùng mweb - Client web di động cực kỳ khó bị chặn format
+            "player_client": ["mweb", "ios"]
         }
     }
 }
