@@ -27,7 +27,6 @@ Commands: /play /pause /resume /skip /stop /queue /nowplaying /volume
 
 from __future__ import annotations
 
-import os
 import asyncio
 import functools
 import re
@@ -61,18 +60,17 @@ COLOUR_SUCCESS = 0x57F287   # mint
 #                 non-URL strings so the intent is always unambiguous.
 #
 YTDL_OPTIONS: dict[str, Any] = {
-    "format"          : "bestaudio/best",
+    "format": "bestaudio/best/worst",
     "default_search"  : "ytsearch",
     "noplaylist"      : True,
     "quiet"           : True,
     "no_warnings"     : True,
-    "cookiefile": os.path.join(os.getcwd(), "cookies.txt"),
-
-    # ĐÃ XÓA dòng source_address ở đây!
+    "cookiefile"      : "cookies.txt",
 
     "extractor_args": {
         "youtube": {
-            "player_client": ["ios", "tvhtml5"] # Có dòng này
+            # Thử đổi sang cụm client lì đòn này:
+            "player_client": ["android_embed", "web_embedded"]
         }
     }
 }
