@@ -65,16 +65,14 @@ YTDL_OPTIONS: dict[str, Any] = {
     "noplaylist"      : True,
     "quiet"           : True,
     "no_warnings"     : True,
-    # Xóa bỏ hoàn toàn "source_address": "0.0.0.0" để hệ thống tự linh hoạt dùng IPv6 nếu có
-
-    # Kích hoạt tính năng OAuth2 xác thực tài khoản trực tiếp
-    "username": "oauth2",
-    "password": "",
+    
+    # Sử dụng file cookies.txt
+    "cookiefile"      : "cookies.txt",
 
     "extractor_args": {
         "youtube": {
-            # Sử dụng các client của TV/Nhúng để né cơ chế quét của Web thông thường
-            "player_client": ["tv", "ios"]
+            # Sử dụng client của IOS và TV cực kỳ lì đòn khi kết hợp với cookie
+            "player_client": ["ios", "tvhtml5"]
         }
     }
 }
