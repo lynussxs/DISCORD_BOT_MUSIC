@@ -1,0 +1,12 @@
+# fly.toml app configuration file for discord-bot-cool-bird-3725
+
+app = "discord-bot-cool-bird-3725"
+primary_region = "sin"
+
+[processes]
+  app = "python bot.py"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
