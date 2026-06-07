@@ -66,6 +66,7 @@ YTDL_OPTIONS: dict[str, Any] = {
     "quiet"           : True,
     "no_warnings"     : True,
     "source_address"  : "0.0.0.0",
+    "cookiefile": "cookies.txt",
 
     "extractor_args": {
         "youtube": {
