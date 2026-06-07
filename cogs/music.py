@@ -27,6 +27,7 @@ Commands: /play /pause /resume /skip /stop /queue /nowplaying /volume
 
 from __future__ import annotations
 
+import os
 import asyncio
 import functools
 import re
@@ -65,14 +66,13 @@ YTDL_OPTIONS: dict[str, Any] = {
     "noplaylist"      : True,
     "quiet"           : True,
     "no_warnings"     : True,
-    
-    # Sử dụng file cookies.txt
-    "cookiefile"      : "cookies.txt",
+    "cookiefile": os.path.join(os.getcwd(), "cookies.txt"),
+
+    # ĐÃ XÓA dòng source_address ở đây!
 
     "extractor_args": {
         "youtube": {
-            # Sử dụng client của IOS và TV cực kỳ lì đòn khi kết hợp với cookie
-            "player_client": ["ios", "tvhtml5"]
+            "player_client": ["ios", "tvhtml5"] # Có dòng này
         }
     }
 }
