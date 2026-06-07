@@ -3,3 +3,6 @@ builder = "nixpacks"
 
 [build.nixpacksPlan.phases.setup]
 nixPkgs = ["python311", "ffmpeg", "nodejs_20"]
+
+[deploy]
+startCommand = "python3 bot.py"
