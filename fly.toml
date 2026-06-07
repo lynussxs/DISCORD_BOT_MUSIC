@@ -1,12 +1,25 @@
-# fly.toml app configuration file for discord-bot-cool-bird-3725
+# fly.toml app configuration file generated for discord-music-bot-xldqzq on 2026-06-07T03:58:52Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "discord-bot-cool-bird-3725"
-primary_region = "sin"
+app = 'discord-music-bot-xldqzq'
+primary_region = 'nrt'
+
+[build]
 
 [processes]
-  app = "python bot.py"
+  app = 'python bot.py'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256
