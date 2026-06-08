@@ -66,17 +66,22 @@ YTDL_OPTIONS: dict[str, Any] = {
     "noplaylist"      : True,
     "quiet"           : True,
     "no_warnings"     : True,
-
-    # ⚠️ THAY PROXY Ở ĐÂY ⚠️
-    # Định dạng: "http://username:password@host:port"
-    "proxy"           : "http://fywznozi:gv94cmc9t7qs@142.111.67.146:5611",
-
     "extractor_args": {
         "youtube": {
-            "player_client": ["android_vr"],
+            "player_client": ["tv_embedded", "android_vr"],
         }
     },
 }
+FFMPEG_BEFORE = (
+    "-reconnect 1 "
+    "-reconnect_streamed 1 "
+    "-reconnect_delay_max 30 "
+    "-reconnect_at_eof 1 "
+    "-reconnect_on_network_error 1 "
+    "-reconnect_on_http_error 4xx,5xx "
+    "-analyzeduration 0 "
+    "-timeout 30000000"
+)
 FFMPEG_BEFORE = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
     "-http_proxy http://fywznozi:gv94cmc9t7qs@142.111.67.146:5611 "  # ⚠️ THAY PROXY Ở ĐÂY (giống proxy bên trên)
@@ -97,7 +102,12 @@ class Track:
         requester: discord.Member | discord.User,
     ) -> None:
         self.title: str            = data.get("title", "Unknown Title")
-        self.url: str              = data["url"]
+        self.url: str              = data.get("url", "")
+        self.webpage_url: str      = data.get("webpage_url", self.url)
+        self.thumbnail: str | None = data.get("thumbnail")
+        self.uploader: str         = data.get("uploader") or data.get("channel", "Unknown")
+        self.duration: int         = int(data.get("duration") or 0)
+        self.requester             = requester
         self.webpage_url: str      = data.get("webpage_url", self.url)
         self.thumbnail: str | None = data.get("thumbnail")
         self.uploader: str         = data.get("uploader") or data.get("channel", "Unknown")
@@ -120,7 +130,7 @@ class Track:
         """
         resolved = query if _URL_RE.match(query) else f"ytsearch:{query}"
         with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
-            partial  = functools.partial(ytdl.extract_info, resolved, download=False)
+            partial = functools.partial(ytdl.extract_info, resolved, download=False)
             data: dict[str, Any] = await loop.run_in_executor(None, partial)
         if "entries" in data:
             data = data["entries"][0]
