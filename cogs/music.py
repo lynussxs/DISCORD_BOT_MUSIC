@@ -61,9 +61,9 @@ COLOUR_SUCCESS = 0x57F287   # mint
 #                 non-URL strings so the intent is always unambiguous.
 #
 YTDL_OPTIONS: dict[str, Any] = {
-    "format"          : "249/139/251/140/bestaudio/best",
+    "format"          : "249/139/251/140/18/bestaudio/best",
     "default_search"  : "ytsearch",
-    "noplaylist"      : True,
+    "noplaylist"      : False,
     "quiet"           : True,
     "no_warnings"     : True,
     "cookiefile"      : os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt"),
@@ -71,6 +71,9 @@ YTDL_OPTIONS: dict[str, Any] = {
         "youtube": {
             "player_client": ["android", "tv_embedded"],
         }
+    },
+    "http_headers": {
+        "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
     },
 }
 FFMPEG_BEFORE = (
@@ -81,7 +84,8 @@ FFMPEG_BEFORE = (
     "-reconnect_on_network_error 1 "
     "-reconnect_on_http_error 4xx,5xx "
     "-analyzeduration 0 "
-    "-timeout 30000000"
+    "-timeout 30000000 "
+    '-user_agent "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"'
 )
 FFMPEG_BEFORE = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
@@ -129,12 +133,34 @@ class Track:
         search rather than relying on the default_search fallback.  This
         improves result quality for artist/title searches.
         """
-        resolved = query if _URL_RE.match(query) else f"ytsearch:{query}"
-        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
+        resolved = query if _URL_RE.match(query) else f"ytsearch1:{query}"
+
+        # Bước 1: Search tối giản để lấy video ID
+        search_opts = {
+            "default_search" : "ytsearch",
+            "noplaylist"     : False,
+            "quiet"          : True,
+            "no_warnings"    : True,
+            "extract_flat"   : True,
+        }
+        with yt_dlp.YoutubeDL(search_opts) as ytdl:
             partial = functools.partial(ytdl.extract_info, resolved, download=False)
+            search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
+
+        if "entries" in search_data:
+            entries = [e for e in search_data["entries"] if e]
+            if not entries:
+                raise ValueError(f"No results found for: {query}")
+            entry = entries[0]
+            video_url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry['id']}"
+        else:
+            video_url = resolved
+
+        # Bước 2: Lấy stream URL với YTDL_OPTIONS đầy đủ
+        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
+            partial = functools.partial(ytdl.extract_info, video_url, download=False)
             data: dict[str, Any] = await loop.run_in_executor(None, partial)
-        if "entries" in data:
-            data = data["entries"][0]
+
         return cls(data, requester)
 
     @property
@@ -633,10 +659,13 @@ class GuildPlayer:
                 # closure remains valid even if self._next is replaced.
                 _loop = self._loop
                 _ev   = self._next
+                _403_flag = [False]
 
                 def _after(err: Exception | None, _l: asyncio.AbstractEventLoop = _loop, _e: asyncio.Event = _ev) -> None:
                     if err:
                         logger.error("VC after-error: %s", err)
+                        if "403" in str(err) or "Forbidden" in str(err):
+                            _403_flag[0] = True
                     _l.call_soon_threadsafe(_e.set)
 
                 self.vc.play(source, after=_after)
@@ -661,6 +690,19 @@ class GuildPlayer:
 
                 # ── Wait for track to finish ───────────────────────────────────
                 await self._next.wait()
+
+                # Notify if 403
+                elapsed = int(time.monotonic() - self._start) if self._start else 0
+                if _403_flag[0] or (elapsed < 3 and not self.vc.is_playing()):
+                    try:
+                        await self.text_ch.send(
+                            embed=_e_err(
+                                "⚠️ Không thể phát",
+                                f"**{track.title}** bị chặn bởi YouTube (403).\nVideo này bị hạn chế theo khu vực hoặc bản quyền. Thử bài khác nhé!",
+                            )
+                        )
+                    except discord.HTTPException:
+                        pass
 
                 # ── Disable buttons on the finished NP card ────────────────────
                 await self._expire_np_message()
