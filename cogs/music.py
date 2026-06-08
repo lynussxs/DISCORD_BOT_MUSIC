@@ -66,9 +66,10 @@ YTDL_OPTIONS: dict[str, Any] = {
     "noplaylist"      : True,
     "quiet"           : True,
     "no_warnings"     : True,
+    "cookiefile"      : os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt"),
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv_embedded", "android_vr"],
+            "player_client": ["android", "tv_embedded"],
         }
     },
 }
