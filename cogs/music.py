@@ -143,7 +143,8 @@ def _get_ytdl_options(cookies: bool = True) -> dict[str, Any]:
     return _ytdl_opts(cookies)
 
 def _ffmpeg_before() -> str:
-    return (
+    proxy = _proxy.get()
+    base = (
         "-reconnect 1 "
         "-reconnect_streamed 1 "
         "-reconnect_delay_max 30 "
@@ -153,6 +154,9 @@ def _ffmpeg_before() -> str:
         "-analyzeduration 0 "
         "-timeout 30000000"
     )
+    if proxy:
+        base += f" -http_proxy {proxy}"
+    return base
 
 # Matches http:// and https:// URLs so we can detect non-URL queries.
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
