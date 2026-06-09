@@ -222,14 +222,14 @@ class Track:
 
         # Bước 2: Lấy stream URL — thử tối đa 2 lần (có cookies rồi không cookies)
         last_err: Exception | None = None
-        for attempt in range(2):
-            use_cookies = attempt == 0
+        for attempt in range(5):  # thử tối đa 5 lần
+            use_cookies = False  # android_vr không support cookies
             opts = _ytdl_opts(use_cookies)
             try:
                 with yt_dlp.YoutubeDL(opts) as ytdl:
                     partial = functools.partial(ytdl.extract_info, video_url, download=False)
                     data: dict[str, Any] = await loop.run_in_executor(None, partial)
-                break
+                break  # thành công
             except Exception as e:
                 last_err = e
                 err_str = str(e)
@@ -237,8 +237,13 @@ class Track:
                     "Requested format", "Sign in", "bot", "403",
                     "Connection refused", "Connection reset", "Unable to download"
                 ])
-                if is_retryable and attempt < 1:
-                    logger.warning("yt-dlp attempt %d failed, retrying without cookies", attempt + 1)
+                if is_retryable and attempt < 4:
+                    current = opts.get("proxy", "")
+                    new_proxy = _proxy.mark_dead(current) if current else _proxy.get()
+                    logger.warning(
+                        "yt-dlp attempt %d failed, rotating proxy to: %s",
+                        attempt + 1, new_proxy[:50] if new_proxy else "none",
+                    )
                     continue
                 raise last_err  # type: ignore
 
