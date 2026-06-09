@@ -151,8 +151,7 @@ def _ffmpeg_before() -> str:
         "-reconnect_at_eof 1 "
         "-reconnect_on_network_error 1 "
         "-reconnect_on_http_error 4xx,5xx "
-        "-analyzeduration 0 "
-        "-timeout 30000000"
+        "-analyzeduration 0"
     )
     if proxy:
         base += f" -http_proxy {proxy}"
