@@ -565,7 +565,7 @@ class GuildPlayer:
     only affect audio at the start of the next track.
     """
 
-    IDLE_TIMEOUT = 180  # seconds of silence before auto-disconnect
+    IDLE_TIMEOUT = 60   # seconds of silence before auto-disconnect (1 phút)
 
     def __init__(
         self,
@@ -812,6 +812,21 @@ class GuildPlayer:
 
                 self._start  = None
                 self.current = None
+
+                # ── Thông báo hết nhạc nếu queue trống ────────────────────────
+                if not self._queue and not self.loop:
+                    try:
+                        e = discord.Embed(
+                            title       = "🎵 Queue Ended",
+                            description = "Hết nhạc rồi! Dùng `/play` để thêm bài mới nhé.",
+                            colour      = COLOUR_QUEUE,
+                        )
+                        e.set_footer(text=f"Bot sẽ tự rời sau {self.IDLE_TIMEOUT}s nếu không có bài mới.")
+                        if track.thumbnail:
+                            e.set_thumbnail(url=track.thumbnail)
+                        await self.text_ch.send(embed=e)
+                    except discord.HTTPException:
+                        pass
 
         except asyncio.CancelledError:
             pass
@@ -1217,30 +1232,158 @@ class Music(commands.Cog):
     ) -> None:
         """
         Clean up the player when the bot is kicked or disconnected externally.
-
-        Also disables the NP message buttons so orphaned controls don't
-        appear interactive after the bot has left the channel.
+        Also auto-leave when all users leave the voice channel.
         """
-        if member.id != self.bot.user.id:  # type: ignore[union-attr]
+        guild = member.guild
+        gid   = guild.id
+
+        # ── Bot bị kick/disconnect ─────────────────────────────────────────────
+        if member.id == self.bot.user.id:  # type: ignore[union-attr]
+            if before.channel is None or after.channel is not None:
+                return
+            p = self._players.pop(gid, None)
+            if not p:
+                return
+            p._task.cancel()
+            logger.info("DISCONNECT | force-removed from voice [guild %d]", gid)
+            if p._np_msg and p._np_view:
+                try:
+                    p._np_view._disable_all()
+                    await p._np_msg.edit(view=p._np_view)
+                except (discord.NotFound, discord.HTTPException):
+                    pass
             return
-        if before.channel is None or after.channel is not None:
-            return   # not a disconnect event
 
-        gid = member.guild.id
-        p   = self._players.pop(gid, None)
-        if not p:
+        # ── User rời voice — kiểm tra còn ai không ────────────────────────────
+        p = self._players.get(gid)
+        if not p or not p.vc.is_connected():
+            return
+        # Nếu user rời khỏi channel mà bot đang ở
+        if before.channel and before.channel.id == p.vc.channel.id:
+            # Đếm số người thật (không phải bot)
+            humans = [m for m in p.vc.channel.members if not m.bot]
+            if not humans:
+                # Không còn ai → tự rời sau 1 phút
+                await asyncio.sleep(60)
+                # Kiểm tra lại
+                p2 = self._players.get(gid)
+                if p2 and p2.vc.is_connected():
+                    humans2 = [m for m in p2.vc.channel.members if not m.bot]
+                    if not humans2:
+                        logger.info("ALONE | auto-leaving empty voice [guild %d]", gid)
+                        try:
+                            await p2.text_ch.send(
+                                embed=discord.Embed(
+                                    title       = "👋  Rời kênh",
+                                    description = "Không còn ai trong kênh nên mình rời rồi nhé!",
+                                    colour      = COLOUR_QUEUE,
+                                )
+                            )
+                        except discord.HTTPException:
+                            pass
+                        await p2.stop()
+                        self._players.pop(gid, None)
+
+
+    # ── /spotify ───────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="spotify", description="Play a Spotify track, album, or playlist via YouTube search.")
+    @app_commands.describe(url="Spotify URL hoặc tên bài hát trên Spotify")
+    @app_commands.guild_only()
+    async def spotify(self, interaction: discord.Interaction, url: str) -> None:
+        err = self._voice_precheck(interaction)
+        if err:
+            await interaction.response.send_message(
+                embed=_e_err("Cannot Play", err), ephemeral=True
+            )
             return
 
-        p._task.cancel()
-        logger.info("DISCONNECT | force-removed from voice [guild %d]", gid)
+        await interaction.response.defer()
 
-        # Disable buttons on the last NP message so they don't mislead users.
-        if p._np_msg and p._np_view:
+        user  = interaction.user
+        guild = interaction.guild
+        assert isinstance(user, discord.Member) and guild is not None
+
+        # Extract Spotify info và search trên YouTube
+        query = await self._resolve_spotify(url)
+        if not query:
+            await interaction.followup.send(
+                embed=_e_err("Spotify Error", "Không thể đọc link Spotify này. Thử dùng tên bài hát thay thế!"),
+                ephemeral=True,
+            )
+            return
+
+        # Connect voice
+        voice_client = guild.voice_client
+        if not isinstance(voice_client, discord.VoiceClient) or not voice_client.is_connected():
+            voice_client = await user.voice.channel.connect()  # type: ignore
+
+        try:
+            track = await Track.from_query(query, user, self.bot.loop)
+        except Exception as exc:
+            await interaction.followup.send(
+                embed=_e_err("Not Found", f"Không tìm thấy: `{query}`\n`{exc}`"),
+                ephemeral=True,
+            )
+            return
+
+        guild_id = interaction.guild_id
+        assert guild_id is not None
+        player = self._get_player(guild_id)
+        if player is None:
+            player = GuildPlayer(
+                vc      = voice_client,
+                text_ch = interaction.channel,  # type: ignore[arg-type]
+                loop    = self.bot.loop,
+                volume  = config.DEFAULT_VOLUME / 100,
+            )
+            self._players[guild_id] = player
+
+        position = player.enqueue(track)
+        if player.vc.is_playing() or player.vc.is_paused():
+            await interaction.followup.send(embed=_e_queued(track, position))
+        else:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title       = "🎵  Spotify → YouTube",
+                    description = f"Loading **[{track.title}]({track.webpage_url})**…",
+                    colour      = 0x1DB954,
+                )
+            )
+
+    async def _resolve_spotify(self, url: str) -> str | None:
+        """
+        Convert Spotify URL → search query cho YouTube.
+        Không cần Spotify API key — parse trực tiếp từ URL hoặc dùng tên.
+        """
+        # Nếu là Spotify URL
+        spotify_re = re.compile(
+            r"https?://open\.spotify\.com/(track|album|playlist)/([A-Za-z0-9]+)"
+        )
+        m = spotify_re.match(url.strip())
+        if m:
+            stype, sid = m.group(1), m.group(2)
             try:
-                p._np_view._disable_all()
-                await p._np_msg.edit(view=p._np_view)
-            except (discord.NotFound, discord.HTTPException):
+                # Dùng Spotify embed API (không cần key)
+                r = requests.get(
+                    f"https://open.spotify.com/oembed?url={url}",
+                    timeout=8,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    title = data.get("title", "")
+                    if title:
+                        return title  # search YouTube bằng tên bài
+            except Exception:
                 pass
+            # Fallback: dùng URL parse
+            return f"spotify {stype} {sid}"
+
+        # Không phải URL → dùng thẳng làm query
+        if url.strip():
+            return url.strip()
+        return None
 
 
 async def setup(bot: commands.Bot) -> None:
