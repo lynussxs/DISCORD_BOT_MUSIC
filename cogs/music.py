@@ -55,12 +55,16 @@ COLOUR_SUCCESS = 0x57F287   # mint
 # ── Webshare Proxy Manager ─────────────────────────────────────────────────────
 
 class WebshareProxyManager:
-    """Proxy manager: ưu tiên Japan → Germany → các proxy từ Webshare API."""
+    """Proxy manager: chỉ dùng Japan → Germany, KHÔNG dùng proxy US."""
 
+    # Chỉ dùng proxy châu Á/EU — không bao giờ dùng proxy US (geo-block)
     PRIORITY = [
-        "http://fywznozi:gv94cmc9t7qs@142.111.67.146:5611",  # Japan (tốt nhất)
-        "http://fywznozi:gv94cmc9t7qs@31.58.9.4:6077",       # Germany (fallback)
+        "http://fywznozi:gv94cmc9t7qs@142.111.67.146:5611",  # Japan ⭐
+        "http://fywznozi:gv94cmc9t7qs@31.58.9.4:6077",       # Germany
     ]
+
+    # Các quốc gia được phép dùng từ Webshare API
+    ALLOWED_COUNTRIES = {"JP", "DE", "SG", "HK", "KR", "TW", "NL", "FR"}
 
     def __init__(self) -> None:
         self.api_key  = os.environ.get("WEBSHARE_API_KEY", "")
@@ -68,9 +72,10 @@ class WebshareProxyManager:
         self._idx     : int = 0
         self._dead    : set[str] = set()
         self._fetched : bool = False
+        self._dead_until: dict[str, float] = {}  # proxy → thời gian hết bị chặn
 
     def _fetch_api(self) -> None:
-        """Lấy thêm proxy từ Webshare API (chỉ fetch 1 lần)."""
+        """Lấy thêm proxy từ Webshare API — chỉ lấy proxy châu Á/EU."""
         if self._fetched or not self.api_key:
             return
         self._fetched = True
@@ -82,6 +87,10 @@ class WebshareProxyManager:
             )
             if r.status_code == 200:
                 for p in r.json().get("results", []):
+                    # Chỉ thêm proxy từ nước được phép
+                    country = p.get("country_code", "US").upper()
+                    if country not in self.ALLOWED_COUNTRIES:
+                        continue
                     url = f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
                     if url not in self._proxies:
                         self._proxies.append(url)
@@ -90,28 +99,37 @@ class WebshareProxyManager:
 
     def get(self) -> str:
         self._fetch_api()
+        now = time.monotonic()
         for i in range(len(self._proxies)):
             url = self._proxies[(self._idx + i) % len(self._proxies)]
-            if url not in self._dead:
-                return url
-        # Tất cả dead → reset
+            # Bỏ qua nếu dead hoặc đang trong thời gian timeout
+            if url in self._dead:
+                continue
+            if self._dead_until.get(url, 0) > now:
+                continue
+            return url
+        # Tất cả đang bị chặn tạm → reset và dùng Japan
         self._dead.clear()
+        self._dead_until.clear()
         self._idx = 0
         return self._proxies[0]
 
-    def mark_dead(self, url: str) -> str:
-        self._dead.add(url)
-        for i in range(len(self._proxies)):
-            candidate = self._proxies[i]
-            if candidate not in self._dead:
-                self._idx = i
-                return candidate
-        self._dead.clear()
-        self._idx = 0
-        return self._proxies[0]
+    def mark_dead(self, url: str, temporary: bool = True) -> str:
+        """
+        Đánh dấu proxy bị chặn.
+        temporary=True → chỉ tạm thời (rate limit), thử lại sau 5 phút.
+        temporary=False → dead hẳn.
+        """
+        if temporary:
+            # Rate limit: thử lại sau 5 phút
+            self._dead_until[url] = time.monotonic() + 300
+        else:
+            self._dead.add(url)
+        return self.get()
 
     def rotate(self) -> str:
-        return self.mark_dead(self.get())
+        current = self.get()
+        return self.mark_dead(current, temporary=True)
 
 _proxy = WebshareProxyManager()
 
@@ -177,11 +195,8 @@ class Track:
         self.uploader: str         = data.get("uploader") or data.get("channel", "Unknown")
         self.duration: int         = int(data.get("duration") or 0)
         self.requester             = requester
-        self.webpage_url: str      = data.get("webpage_url", self.url)
-        self.thumbnail: str | None = data.get("thumbnail")
-        self.uploader: str         = data.get("uploader") or data.get("channel", "Unknown")
-        self.duration: int         = int(data.get("duration") or 0)
-        self.requester             = requester
+        self.video_id: str         = data.get("id", "")
+        self._url_fetched_at: float = time.monotonic()
 
     @classmethod
     async def from_query(
@@ -222,26 +237,31 @@ class Track:
 
         # Bước 2: Lấy stream URL — thử tối đa 2 lần (có cookies rồi không cookies)
         last_err: Exception | None = None
-        for attempt in range(5):  # thử tối đa 5 lần
-            use_cookies = False  # android_vr không support cookies
-            opts = _ytdl_opts(use_cookies)
+        for attempt in range(5):
+            opts = _ytdl_opts(False)
             try:
                 with yt_dlp.YoutubeDL(opts) as ytdl:
                     partial = functools.partial(ytdl.extract_info, video_url, download=False)
                     data: dict[str, Any] = await loop.run_in_executor(None, partial)
-                break  # thành công
+                break
             except Exception as e:
                 last_err = e
                 err_str = str(e)
-                is_retryable = any(x in err_str for x in [
-                    "Requested format", "Sign in", "bot", "403",
+
+                # Lỗi geo-block / video không có — không retry
+                if any(x in err_str for x in ["not available", "unavailable", "private", "removed"]):
+                    raise last_err
+
+                # Lỗi rate limit / bot check — rotate proxy tạm thời
+                is_rate_limit = any(x in err_str for x in [
+                    "Sign in", "bot", "Requested format", "403",
                     "Connection refused", "Connection reset", "Unable to download"
                 ])
-                if is_retryable and attempt < 4:
+                if is_rate_limit and attempt < 4:
                     current = opts.get("proxy", "")
-                    new_proxy = _proxy.mark_dead(current) if current else _proxy.get()
+                    new_proxy = _proxy.mark_dead(current, temporary=True) if current else _proxy.get()
                     logger.warning(
-                        "yt-dlp attempt %d failed, rotating proxy to: %s",
+                        "yt-dlp attempt %d failed (rate limit), trying proxy: %s",
                         attempt + 1, new_proxy[:50] if new_proxy else "none",
                     )
                     continue
@@ -255,28 +275,40 @@ class Track:
         m, sec = divmod(r, 60)
         return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
-    async def make_source(self, volume: float) -> discord.FFmpegOpusAudio:
-        """
-        Build an FFmpegOpusAudio source with the given volume baked in.
+    @property
+    def url_is_fresh(self) -> bool:
+        """URL stream còn hạn không (YouTube expire sau ~6 tiếng)."""
+        return (time.monotonic() - self._url_fetched_at) < 18_000  # 5 tiếng
 
-        Uses the direct constructor (not from_probe) because from_probe
-        detects Opus input and injects -c:a copy, which is incompatible
-        with -filter:a volume=X (FFmpeg error: filtering and streamcopy
-        cannot be used together).  The direct constructor always uses
-        libopus re-encoding, so the volume filter works correctly.
+    async def refresh_url(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Refresh URL stream nếu sắp hết hạn."""
+        if self.url_is_fresh:
+            return
+        try:
+            opts = _ytdl_opts(False)
+            with yt_dlp.YoutubeDL(opts) as ytdl:
+                partial = functools.partial(ytdl.extract_info, self.webpage_url, download=False)
+                data = await loop.run_in_executor(None, partial)
+            self.url = data.get("url", self.url)
+            self._url_fetched_at = time.monotonic()
+            logger.info("URL refreshed for '%s'", self.title)
+        except Exception as exc:
+            logger.warning("Failed to refresh URL for '%s': %s", self.title, exc)
 
-        Effective FFmpeg command:
-            ffmpeg -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5
-                   -i <url>
-                   -c:a libopus -b:a 128k
-                   -vn -filter:a volume=<X>
-                   -f opus pipe:1
-        """
+    async def make_source(self, volume: float, seek: int = 0) -> discord.FFmpegOpusAudio:
         safe_vol = max(0.01, min(2.0, volume))
+        # Build audio filter
+        filters = [f"volume={safe_vol:.3f}"]
+        if getattr(self, '_bassboost', False) if hasattr(self, '_bassboost') else False:
+            filters.append("bass=g=10:f=110:w=0.3")
+        if getattr(self, '_nightcore', False) if hasattr(self, '_nightcore') else False:
+            filters.append("asetrate=44100*1.25,aresample=44100")
+        filter_str = ",".join(filters)
+        seek_opt = f"-ss {seek} " if seek > 0 else ""
         return discord.FFmpegOpusAudio(
             self.url,
-            before_options=_ffmpeg_before(),
-            options=f"-vn -filter:a volume={safe_vol:.3f} -b:a 64k",  # 64k đủ nghe, nhẹ hơn qua proxy
+            before_options=seek_opt + _ffmpeg_before(),
+            options=f"-vn -filter:a \"{filter_str}\" -b:a 64k",
         )
 
 
@@ -582,10 +614,15 @@ class GuildPlayer:
         self.current: Track | None = None
         self.volume: float         = volume
         self._start: float | None  = None
-        self.loop: bool            = False   # loop current track
-        self.shuffle: bool         = False   # shuffle queue
-        self.autoplay: bool        = False   # autoplay related tracks
-        self._history: list[Track] = []      # for back button
+        self.loop: bool            = False
+        self.shuffle: bool         = False
+        self.autoplay: bool        = False
+        self._history: list[Track] = []
+        self._preloaded: Track | None = None      # pre-load bài tiếp
+        self._old_np_msgs: list[discord.Message] = []  # NP cũ để xóa
+        self._247_mode: bool       = False        # 24/7 mode
+        self._bassboost: bool      = False        # bassboost effect
+        self._nightcore: bool      = False        # nightcore effect
 
         # References to the last "Now Playing" message + view so we can
         # disable its buttons when the track ends or the bot disconnects.
@@ -598,9 +635,10 @@ class GuildPlayer:
     # ── Queue ──────────────────────────────────────────────────────────────────
 
     def enqueue(self, track: Track) -> int:
-        """Append a track and return its 1-based queue position."""
+        """Append track (bỏ qua nếu trùng) và return vị trí 1-based. -1 = trùng."""
+        if any(t.webpage_url == track.webpage_url for t in self._queue):
+            return -1
         self._queue.append(track)
-        # Wake the player loop if it is idle-waiting.
         if not self.vc.is_playing() and not self.vc.is_paused():
             self._next.set()
         return len(self._queue)
@@ -762,9 +800,16 @@ class GuildPlayer:
 
                 self.vc.play(source, after=_after)
 
-                # ── Now Playing message with control buttons ────────────────────
+                # ── Now Playing message — xóa tin nhắn NP cũ ──────────────────
                 view = MusicControlView(self)
                 self._np_view = view
+                # Xóa NP messages cũ trước khi gửi cái mới
+                for old_msg in list(self._old_np_msgs):
+                    try:
+                        await old_msg.delete()
+                        self._old_np_msgs.remove(old_msg)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        self._old_np_msgs.remove(old_msg)
                 try:
                     self._np_msg = await self.text_ch.send(
                         embed=_e_np(
@@ -781,6 +826,10 @@ class GuildPlayer:
                 except discord.HTTPException as exc:
                     logger.warning("NP message failed: %s", exc)
                     self._np_msg = None
+
+                # ── Pre-load bài tiếp theo trong background ────────────────────
+                if self._queue and not self._preloaded:
+                    asyncio.ensure_future(self._preload_next(self._queue[0]))
 
                 # ── Wait for track to finish ───────────────────────────────────
                 await self._next.wait()
@@ -833,14 +882,31 @@ class GuildPlayer:
         except Exception:
             logger.exception("Unhandled error in player loop [guild %d]", self.vc.guild.id)
 
+    async def _preload_next(self, track: Track) -> None:
+        """Pre-load URL bài tiếp theo trong background."""
+        try:
+            await track.refresh_url(self._loop)
+            self._preloaded = track
+            logger.debug("Pre-loaded: '%s'", track.title)
+        except Exception as exc:
+            logger.debug("Pre-load failed for '%s': %s", track.title, exc)
+
     async def _expire_np_message(self) -> None:
-        """Disable all buttons on the last NP message after a track ends."""
+        """Disable buttons NP cũ và xóa tin nhắn cũ để dọn chat."""
         if self._np_msg and self._np_view:
             try:
                 self._np_view._disable_all()
                 await self._np_msg.edit(view=self._np_view)
+                self._old_np_msgs.append(self._np_msg)
+                # Giữ tối đa 2 message cũ, xóa cái còn lại
+                while len(self._old_np_msgs) > 2:
+                    old = self._old_np_msgs.pop(0)
+                    try:
+                        await old.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
             except discord.NotFound:
-                pass   # message was deleted
+                pass
             except discord.HTTPException as exc:
                 logger.debug("Could not expire NP message: %s", exc)
         self._np_msg  = None
@@ -988,7 +1054,16 @@ class Music(commands.Cog):
         )
 
         # ── 6. Reply ──────────────────────────────────────────────────────────
-        if player.vc.is_playing() or player.vc.is_paused():
+        if position == -1:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title       = "⚠️ Trùng bài",
+                    description = f"**{track.title}** đã có trong queue rồi!",
+                    colour      = COLOUR_PAUSE,
+                ),
+                ephemeral=True,
+            )
+        elif player.vc.is_playing() or player.vc.is_paused():
             await interaction.followup.send(embed=_e_queued(track, position))
         else:
             await interaction.followup.send(
@@ -1384,6 +1459,153 @@ class Music(commands.Cog):
         if url.strip():
             return url.strip()
         return None
+
+    # ── /seek ──────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="seek", description="Tua đến vị trí bất kỳ. Ví dụ: 1:30 hoặc 90")
+    @app_commands.describe(position="Thời gian (vd: 1:30 hoặc 90)")
+    @app_commands.guild_only()
+    async def seek(self, interaction: discord.Interaction, position: str) -> None:
+        p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not p or not p.current:
+            await interaction.response.send_message(
+                embed=_e_err("Nothing Playing", "Không có bài nào đang phát."), ephemeral=True
+            )
+            return
+        try:
+            if ":" in position:
+                parts = position.split(":")
+                secs = int(parts[-1]) + int(parts[-2]) * 60
+                if len(parts) == 3:
+                    secs += int(parts[0]) * 3600
+            else:
+                secs = int(position)
+        except ValueError:
+            await interaction.response.send_message(
+                embed=_e_err("Invalid", "Dùng `1:30` hoặc `90` giây."), ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        track = p.current
+        safe_vol = max(0.01, min(2.0, p.volume))
+        try:
+            source = discord.FFmpegOpusAudio(
+                track.url,
+                before_options=f"-ss {secs} " + _ffmpeg_before(),
+                options=f"-vn -filter:a volume={safe_vol:.3f} -b:a 64k",
+            )
+            p.vc.stop()
+            await asyncio.sleep(0.3)
+            p._start = time.monotonic() - secs
+            p.vc.play(source, after=lambda e: p._loop.call_soon_threadsafe(p._next.set))
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title       = "⏩ Seeked",
+                    description = f"Tua đến **{_fmt(secs)}** trong **{track.title}**",
+                    colour      = COLOUR_SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await interaction.followup.send(embed=_e_err("Seek Failed", str(exc)), ephemeral=True)
+
+    # ── /history ───────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="history", description="Xem lịch sử bài đã phát.")
+    @app_commands.guild_only()
+    async def history(self, interaction: discord.Interaction) -> None:
+        p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not p or not p._history:
+            await interaction.response.send_message(
+                embed=discord.Embed(title="📜 History", description="Chưa có bài nào!", colour=COLOUR_QUEUE),
+                ephemeral=True,
+            )
+            return
+        desc = "\n".join(
+            f"`{i+1}.` [{t.title}]({t.webpage_url}) — `{t.duration_str}` • {t.requester.mention}"
+            for i, t in enumerate(reversed(p._history[-10:]))
+        )
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title       = f"📜 History ({len(p._history)} bài)",
+                description = desc,
+                colour      = COLOUR_QUEUE,
+            ),
+            ephemeral=True,
+        )
+
+    # ── /247 ───────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="247", description="Bật/tắt chế độ 24/7 — bot không tự rời.")
+    @app_commands.guild_only()
+    async def mode_247(self, interaction: discord.Interaction) -> None:
+        p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not p:
+            await interaction.response.send_message(
+                embed=_e_err("Not Connected", "Bot chưa trong voice channel."), ephemeral=True
+            )
+            return
+        p._247_mode = not p._247_mode
+        if p._247_mode:
+            p.IDLE_TIMEOUT = 999999  # type: ignore[attr-defined]
+        else:
+            p.IDLE_TIMEOUT = 60  # type: ignore[attr-defined]
+        status = "✅ BẬT" if p._247_mode else "❌ TẮT"
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title       = f"🕐 Chế độ 24/7: {status}",
+                description = "Bot sẽ ở lại voice suốt." if p._247_mode
+                              else "Bot sẽ tự rời sau 1 phút không có nhạc.",
+                colour      = COLOUR_SUCCESS if p._247_mode else COLOUR_QUEUE,
+            )
+        )
+
+    # ── /bassboost ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="bassboost", description="Bật/tắt Bassboost (áp dụng từ bài tiếp).")
+    @app_commands.guild_only()
+    async def bassboost(self, interaction: discord.Interaction) -> None:
+        p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not p:
+            await interaction.response.send_message(
+                embed=_e_err("Not Connected", "Bot chưa trong voice channel."), ephemeral=True
+            )
+            return
+        p._bassboost = not p._bassboost
+        if p._nightcore and p._bassboost:
+            p._nightcore = False  # tắt nightcore nếu bật bassboost
+        status = "✅ BẬT" if p._bassboost else "❌ TẮT"
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title       = f"🎸 Bassboost: {status}",
+                description = "Âm bass được tăng cường. Áp dụng từ bài tiếp theo!" if p._bassboost
+                              else "Đã tắt Bassboost.",
+                colour      = COLOUR_SUCCESS if p._bassboost else COLOUR_QUEUE,
+            )
+        )
+
+    # ── /nightcore ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="nightcore", description="Bật/tắt Nightcore (speed up + pitch).")
+    @app_commands.guild_only()
+    async def nightcore(self, interaction: discord.Interaction) -> None:
+        p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not p:
+            await interaction.response.send_message(
+                embed=_e_err("Not Connected", "Bot chưa trong voice channel."), ephemeral=True
+            )
+            return
+        p._nightcore = not p._nightcore
+        if p._bassboost and p._nightcore:
+            p._bassboost = False  # tắt bassboost nếu bật nightcore
+        status = "✅ BẬT" if p._nightcore else "❌ TẮT"
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title       = f"🌙 Nightcore: {status}",
+                description = "Nhạc được tăng tốc và pitch. Áp dụng từ bài tiếp theo!" if p._nightcore
+                              else "Đã tắt Nightcore.",
+                colour      = COLOUR_SUCCESS if p._nightcore else COLOUR_QUEUE,
+            )
+        )
 
 
 async def setup(bot: commands.Bot) -> None:
