@@ -252,7 +252,7 @@ class Track:
                 if any(x in err_str for x in ["not available", "unavailable", "private", "removed"]):
                     raise last_err
 
-                # Lỗi rate limit / bot check — rotate proxy tạm thời
+                # Lỗi rate limit / bot check — rotate proxy + delay
                 is_rate_limit = any(x in err_str for x in [
                     "Sign in", "bot", "Requested format", "403",
                     "Connection refused", "Connection reset", "Unable to download"
@@ -260,10 +260,12 @@ class Track:
                 if is_rate_limit and attempt < 4:
                     current = opts.get("proxy", "")
                     new_proxy = _proxy.mark_dead(current, temporary=True) if current else _proxy.get()
+                    delay = 2 * (attempt + 1)  # 2s, 4s, 6s, 8s
                     logger.warning(
-                        "yt-dlp attempt %d failed (rate limit), trying proxy: %s",
-                        attempt + 1, new_proxy[:50] if new_proxy else "none",
+                        "yt-dlp attempt %d failed (rate limit), waiting %ds then trying: %s",
+                        attempt + 1, delay, new_proxy[:50] if new_proxy else "none",
                     )
+                    await asyncio.sleep(delay)
                     continue
                 raise last_err  # type: ignore
 
