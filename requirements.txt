@@ -12,6 +12,7 @@ PyNaCl>=1.5.0
 yt-dlp
 youtube-search-python
 requests
+spotipy
 # Loads .env files into os.environ
 python-dotenv>=1.0.0
 
