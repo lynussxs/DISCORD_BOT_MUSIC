@@ -184,7 +184,9 @@ def _ffmpeg_before() -> str:
         "-reconnect_at_eof 1 "
         "-reconnect_on_network_error 1 "
         "-reconnect_on_http_error 4xx,5xx "
-        "-analyzeduration 0"
+        "-analyzeduration 0 "
+        "-fflags +nobuffer "     # giảm buffer delay
+        "-flags low_delay"       # giảm latency
     )
     if proxy:
         base += f" -http_proxy {proxy}"
@@ -856,9 +858,34 @@ class GuildPlayer:
                 if self._queue and not self._preloaded:
                     asyncio.ensure_future(self._preload_next(self._queue[0]))
 
-                # ── Wait for track to finish ───────────────────────────────────
+                # ── Wait for track to finish — auto-refresh nếu stream đứt ────
                 self._next.clear()
-                await self._next.wait()
+                while True:
+                    await self._next.wait()
+                    self._next.clear()
+
+                    elapsed = int(time.monotonic() - self._start) if self._start else 0
+
+                    # Nếu bài đã phát xong hoặc bị skip/stop → thoát
+                    if self.current is None or self.current != track:
+                        break
+                    if not self.vc.is_playing() and not self.vc.is_paused():
+                        # Stream đứt giữa chừng — thử refresh URL nếu bài chưa hết
+                        if track.duration > 0 and elapsed < track.duration - 5:
+                            logger.warning(
+                                "STREAM DROP at %ds/%ds for '%s', refreshing URL…",
+                                elapsed, track.duration, track.title,
+                            )
+                            try:
+                                await track.refresh_url(self._loop)
+                                new_src = await track.make_source(self.volume, seek=elapsed)
+                                self.vc.play(new_src, after=_after)
+                                logger.info("STREAM RESUMED at %ds for '%s'", elapsed, track.title)
+                                continue  # tiếp tục chờ
+                            except Exception as exc:
+                                logger.error("STREAM REFRESH FAILED: %s", exc)
+                        break
+                    break
 
                 # Notify if 403
                 elapsed = int(time.monotonic() - self._start) if self._start else 0
