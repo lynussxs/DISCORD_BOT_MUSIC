@@ -327,16 +327,12 @@ class Track:
         seek_opt = f"-ss {seek} " if seek > 0 else ""
         return discord.FFmpegOpusAudio(
             self.url,
-            before_options=(
-                seek_opt + _ffmpeg_before() +
-                " -reconnect_streamed_at_eof 1"  # reconnect khi stream dài hết EOF
-            ),
+            before_options=seek_opt + _ffmpeg_before(),
             options=(
                 f"-vn "
                 f"-filter:a \"{filter_str}\" "
-                f"-b:a 320k "          # 320kbps cho chất lượng cao nhất
-                f"-application audio " # tối ưu cho music (không phải speech)
-                f"-frame_duration 20"  # giảm latency
+                f"-b:a 320k "
+                f"-application audio"
             ),
         )
 
