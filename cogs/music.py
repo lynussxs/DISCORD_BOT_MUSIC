@@ -146,28 +146,32 @@ _proxy = WebshareProxyManager()
 
 # ── yt-dlp options ─────────────────────────────────────────────────────────────
 
-def _ytdl_opts(cookies: bool = True) -> dict[str, Any]:
-    proxy = _proxy.get()
+def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     opts: dict[str, Any] = {
-        "format"         : "249/139/251/140/18/bestaudio/best",
-        "default_search" : "ytsearch",
-        "noplaylist"     : False,
-        "quiet"          : True,
-        "no_warnings"    : True,
-        "proxy"          : proxy,  # luôn dùng proxy
-        "extractor_args" : {
+        # Ưu tiên opus/webm chất lượng cao nhất cho 320kbps
+        "format"          : "bestaudio[ext=webm][abr>=128]/bestaudio[ext=m4a]/bestaudio/best",
+        "default_search"  : "ytsearch",
+        "noplaylist"      : False,
+        "quiet"           : True,
+        "no_warnings"     : True,
+        "extractor_args"  : {
             "youtube": {
                 "player_client": ["android_vr", "tv_embedded"],
             }
         },
+        "http_chunk_size" : 10485760,  # 10MB chunks — tối ưu cho video dài
     }
+    if use_proxy:
+        proxy = _proxy.get()
+        if proxy:
+            opts["proxy"] = proxy
     if cookies:
         cp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt")
         if os.path.exists(cp):
             opts["cookiefile"] = cp
     return opts
 
-# Giữ lại tên cũ để không cần sửa nhiều chỗ — dùng hàm thay vì dict tĩnh
+# Giữ lại tên cũ
 def _get_ytdl_options(cookies: bool = True) -> dict[str, Any]:
     return _ytdl_opts(cookies)
 
@@ -246,10 +250,11 @@ class Track:
         else:
             video_url = resolved
 
-        # Bước 2: Lấy stream URL — thử tối đa 2 lần (có cookies rồi không cookies)
+        # Bước 2: Thử không proxy trước → bị chặn thì dùng proxy
         last_err: Exception | None = None
         for attempt in range(5):
-            opts = _ytdl_opts(False)
+            use_proxy = attempt > 0  # attempt 0: không proxy, 1+: dùng proxy
+            opts = _ytdl_opts(False, use_proxy=use_proxy)
             try:
                 with yt_dlp.YoutubeDL(opts) as ytdl:
                     partial = functools.partial(ytdl.extract_info, video_url, download=False)
@@ -259,7 +264,7 @@ class Track:
                 last_err = e
                 err_str = str(e)
 
-                # Lỗi geo-block / video không có — không retry
+                # Lỗi geo-block / video bị xóa — không retry
                 if any(x in err_str for x in ["not available", "unavailable", "private", "removed"]):
                     raise last_err
 
@@ -270,13 +275,16 @@ class Track:
                 ])
                 if is_rate_limit and attempt < 4:
                     current = opts.get("proxy", "")
-                    new_proxy = _proxy.mark_dead(current, temporary=True) if current else _proxy.get()
-                    delay = 2 * (attempt + 1)  # 2s, 4s, 6s, 8s
+                    if current:
+                        _proxy.mark_dead(current, temporary=True)
+                    delay = 2 * attempt  # 0s, 2s, 4s, 6s
                     logger.warning(
-                        "yt-dlp attempt %d failed (rate limit), waiting %ds then trying: %s",
-                        attempt + 1, delay, new_proxy[:50] if new_proxy else "none",
+                        "yt-dlp attempt %d failed, waiting %ds then retry%s",
+                        attempt + 1, delay,
+                        " with proxy" if attempt >= 1 else " without proxy",
                     )
-                    await asyncio.sleep(delay)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
                     continue
                 raise last_err  # type: ignore
 
@@ -310,18 +318,26 @@ class Track:
 
     async def make_source(self, volume: float, seek: int = 0) -> discord.FFmpegOpusAudio:
         safe_vol = max(0.01, min(2.0, volume))
-        # Build audio filter
         filters = [f"volume={safe_vol:.3f}"]
-        if getattr(self, '_bassboost', False) if hasattr(self, '_bassboost') else False:
+        if getattr(self, '_bassboost', False):
             filters.append("bass=g=10:f=110:w=0.3")
-        if getattr(self, '_nightcore', False) if hasattr(self, '_nightcore') else False:
+        if getattr(self, '_nightcore', False):
             filters.append("asetrate=44100*1.25,aresample=44100")
         filter_str = ",".join(filters)
         seek_opt = f"-ss {seek} " if seek > 0 else ""
         return discord.FFmpegOpusAudio(
             self.url,
-            before_options=seek_opt + _ffmpeg_before(),
-            options=f"-vn -filter:a \"{filter_str}\" -b:a 64k",
+            before_options=(
+                seek_opt + _ffmpeg_before() +
+                " -reconnect_streamed_at_eof 1"  # reconnect khi stream dài hết EOF
+            ),
+            options=(
+                f"-vn "
+                f"-filter:a \"{filter_str}\" "
+                f"-b:a 320k "          # 320kbps cho chất lượng cao nhất
+                f"-application audio " # tối ưu cho music (không phải speech)
+                f"-frame_duration 20"  # giảm latency
+            ),
         )
 
 
@@ -881,10 +897,13 @@ class GuildPlayer:
                     try:
                         e = discord.Embed(
                             title       = "🎵 Queue Ended",
-                            description = "Hết nhạc rồi! Dùng `/play` để thêm bài mới nhé.",
+                            description = (
+                                f"Bài cuối: **[{track.title}]({track.webpage_url})**\n\n"
+                                f"Hết nhạc rồi! Dùng `/play` để thêm bài mới."
+                            ),
                             colour      = COLOUR_QUEUE,
                         )
-                        e.set_footer(text=f"Bot sẽ tự rời sau {self.IDLE_TIMEOUT}s nếu không có bài mới.")
+                        e.set_footer(text=f"⏱ Bot sẽ tự rời sau {self.IDLE_TIMEOUT}s • Đã phát {len(self._history)} bài")
                         if track.thumbnail:
                             e.set_thumbnail(url=track.thumbnail)
                         await self.text_ch.send(embed=e)
@@ -1184,23 +1203,39 @@ class Music(commands.Cog):
         gid = interaction.guild_id
         assert gid is not None
 
+        # Lấy player HOẶC tìm bot đang trong voice
         p = self._get_player(gid)
+        guild = interaction.guild
+        assert guild is not None
+
+        # Nếu không có player nhưng bot vẫn trong voice → disconnect luôn
         if not p:
+            vc = guild.voice_client
+            if vc and isinstance(vc, discord.VoiceClient):
+                await interaction.response.defer()
+                await vc.disconnect()
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title       = "⏹  Disconnected",
+                        description = "Đã rời voice channel.",
+                        colour      = COLOUR_STOP,
+                    )
+                )
+                return
             await interaction.response.send_message(
-                embed=_e_err("Not Connected", "I'm not in a voice channel."),
+                embed=_e_err("Not Connected", "Bot không có trong voice channel."),
                 ephemeral=True,
             )
             return
 
-        # Defer immediately — stop() awaits task cancellation and voice disconnect.
         await interaction.response.defer()
         await p.stop()
-        self._players.pop(gid, None)   # pop instead of del — safe if already removed
+        self._players.pop(gid, None)
 
         await interaction.followup.send(
             embed=discord.Embed(
                 title       = "⏹  Stopped",
-                description = "Cleared the queue and disconnected.",
+                description = "Đã dừng nhạc và rời voice channel.",
                 colour      = COLOUR_STOP,
             )
         )
