@@ -35,6 +35,17 @@ import requests
 import time
 from typing import Any
 
+# Spotify API (tuỳ chọn — chỉ dùng nếu có credentials)
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+    _sp_client = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+        client_id     = os.environ.get("SPOTIFY_CLIENT_ID", ""),
+        client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", ""),
+    )) if os.environ.get("SPOTIFY_CLIENT_ID") else None
+except Exception:
+    _sp_client = None
+
 import discord
 import yt_dlp
 from discord import app_commands
@@ -723,13 +734,13 @@ class GuildPlayer:
         """
         try:
             while True:
-                self._next.clear()
 
-                # ── Idle wait ─────────────────────────────────────────────────
-                if not self._queue:
+                # ── Idle wait — CHỈ khi queue trống và không phát nhạc ────────
+                if not self._queue and not self.vc.is_playing() and not self.vc.is_paused():
+                    self._next.clear()
                     try:
                         await asyncio.wait_for(
-                            self._next.wait(), timeout=self.IDLE_TIMEOUT
+                            self._next.wait(), timeout=self.IDLE_TIMEOUT if not self._247_mode else None
                         )
                     except asyncio.TimeoutError:
                         logger.info(
@@ -750,6 +761,7 @@ class GuildPlayer:
                         return
 
                 if not self._queue:
+                    await asyncio.sleep(0.5)
                     continue
 
                 # ── Pop next track (shuffle support) ───────────────────────────
@@ -805,7 +817,6 @@ class GuildPlayer:
                 # ── Now Playing message — xóa tin nhắn NP cũ ──────────────────
                 view = MusicControlView(self)
                 self._np_view = view
-                # Xóa NP messages cũ trước khi gửi cái mới
                 for old_msg in list(self._old_np_msgs):
                     try:
                         await old_msg.delete()
@@ -834,6 +845,7 @@ class GuildPlayer:
                     asyncio.ensure_future(self._preload_next(self._queue[0]))
 
                 # ── Wait for track to finish ───────────────────────────────────
+                self._next.clear()
                 await self._next.wait()
 
                 # Notify if 403
@@ -1364,8 +1376,8 @@ class Music(commands.Cog):
 
     # ── /spotify ───────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="spotify", description="Play a Spotify track, album, or playlist via YouTube search.")
-    @app_commands.describe(url="Spotify URL hoặc tên bài hát trên Spotify")
+    @app_commands.command(name="spotify", description="Phát nhạc từ Spotify — track, album hoặc playlist.")
+    @app_commands.describe(url="Spotify URL hoặc tên bài hát")
     @app_commands.guild_only()
     async def spotify(self, interaction: discord.Interaction, url: str) -> None:
         err = self._voice_precheck(interaction)
@@ -1381,11 +1393,11 @@ class Music(commands.Cog):
         guild = interaction.guild
         assert isinstance(user, discord.Member) and guild is not None
 
-        # Extract Spotify info và search trên YouTube
-        query = await self._resolve_spotify(url)
-        if not query:
+        # Resolve Spotify → queries
+        result = await self._resolve_spotify(url)
+        if not result:
             await interaction.followup.send(
-                embed=_e_err("Spotify Error", "Không thể đọc link Spotify này. Thử dùng tên bài hát thay thế!"),
+                embed=_e_err("Spotify Error", "Không thể đọc link này!"),
                 ephemeral=True,
             )
             return
@@ -1394,15 +1406,6 @@ class Music(commands.Cog):
         voice_client = guild.voice_client
         if not isinstance(voice_client, discord.VoiceClient) or not voice_client.is_connected():
             voice_client = await user.voice.channel.connect()  # type: ignore
-
-        try:
-            track = await Track.from_query(query, user, self.bot.loop)
-        except Exception as exc:
-            await interaction.followup.send(
-                embed=_e_err("Not Found", f"Không tìm thấy: `{query}`\n`{exc}`"),
-                ephemeral=True,
-            )
-            return
 
         guild_id = interaction.guild_id
         assert guild_id is not None
@@ -1416,48 +1419,97 @@ class Music(commands.Cog):
             )
             self._players[guild_id] = player
 
-        position = player.enqueue(track)
-        if player.vc.is_playing() or player.vc.is_paused():
-            await interaction.followup.send(embed=_e_queued(track, position))
+        # Handle single track vs album/playlist
+        queries = result if isinstance(result, list) else [result]
+
+        added = 0
+        first_track = None
+        for q in queries:
+            try:
+                track = await Track.from_query(q, user, self.bot.loop)
+                pos = player.enqueue(track)
+                if pos != -1:
+                    added += 1
+                    if first_track is None:
+                        first_track = track
+            except Exception:
+                continue
+
+        if not first_track:
+            await interaction.followup.send(
+                embed=_e_err("Not Found", "Không tìm thấy bài nào!"),
+                ephemeral=True,
+            )
+            return
+
+        if len(queries) == 1:
+            # Single track
+            if player.vc.is_playing() or player.vc.is_paused():
+                await interaction.followup.send(embed=_e_queued(first_track, added))
+            else:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title       = "🎵 Spotify",
+                        description = f"Loading **[{first_track.title}]({first_track.webpage_url})**…",
+                        colour      = 0x1DB954,
+                    )
+                )
         else:
+            # Album/Playlist
             await interaction.followup.send(
                 embed=discord.Embed(
-                    title       = "🎵  Spotify → YouTube",
-                    description = f"Loading **[{track.title}]({track.webpage_url})**…",
+                    title       = "🎵 Spotify Playlist",
+                    description = f"Đã thêm **{added}** bài vào queue!\nĐang phát: **{first_track.title}**",
                     colour      = 0x1DB954,
-                )
+                ).set_thumbnail(url=first_track.thumbnail or "")
             )
 
-    async def _resolve_spotify(self, url: str) -> str | None:
-        """
-        Convert Spotify URL → search query cho YouTube.
-        Không cần Spotify API key — parse trực tiếp từ URL hoặc dùng tên.
-        """
-        # Nếu là Spotify URL
+    async def _resolve_spotify(self, url: str) -> list[str] | str | None:
+        """Convert Spotify URL → search queries cho YouTube."""
         spotify_re = re.compile(
             r"https?://open\.spotify\.com/(track|album|playlist)/([A-Za-z0-9]+)"
         )
         m = spotify_re.match(url.strip())
-        if m:
+
+        if m and _sp_client:
             stype, sid = m.group(1), m.group(2)
             try:
-                # Dùng Spotify embed API (không cần key)
+                if stype == "track":
+                    data = _sp_client.track(sid)
+                    artists = ", ".join(a["name"] for a in data["artists"])
+                    return f"{data['name']} {artists}"
+                elif stype == "album":
+                    data = _sp_client.album_tracks(sid)
+                    queries = []
+                    for item in data["items"][:50]:
+                        artists = ", ".join(a["name"] for a in item["artists"])
+                        queries.append(f"{item['name']} {artists}")
+                    return queries
+                elif stype == "playlist":
+                    data = _sp_client.playlist_tracks(sid)
+                    queries = []
+                    for item in data["items"][:50]:
+                        track = item.get("track")
+                        if not track:
+                            continue
+                        artists = ", ".join(a["name"] for a in track["artists"])
+                        queries.append(f"{track['name']} {artists}")
+                    return queries
+            except Exception as exc:
+                logger.warning("Spotify API error: %s", exc)
+
+        # Fallback oembed
+        if m:
+            try:
                 r = requests.get(
                     f"https://open.spotify.com/oembed?url={url}",
-                    timeout=8,
-                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=8, headers={"User-Agent": "Mozilla/5.0"},
                 )
                 if r.status_code == 200:
-                    data = r.json()
-                    title = data.get("title", "")
-                    if title:
-                        return title  # search YouTube bằng tên bài
+                    return r.json().get("title", "")
             except Exception:
                 pass
-            # Fallback: dùng URL parse
-            return f"spotify {stype} {sid}"
 
-        # Không phải URL → dùng thẳng làm query
         if url.strip():
             return url.strip()
         return None
