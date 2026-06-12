@@ -36,33 +36,15 @@ import time
 from typing import Any
 
 import anthropic as _anthropic
+import httpx as _httpx  # cho OpenRouter async calls
 
 # ── AI Error Handler ───────────────────────────────────────────────────────────
-# Khi bot gặp lỗi, tự gọi Claude API phân tích và thử fix runtime
+# Khi bot gặp lỗi, tự gọi AI API phân tích và thử fix runtime
+# Ưu tiên: Anthropic → OpenRouter free (deepseek-r1)
 
 _ai_client: _anthropic.AsyncAnthropic | None = None
 
-def _get_ai_client() -> "_anthropic.AsyncAnthropic | None":
-    global _ai_client
-    if _ai_client is None:
-        key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if key:
-            _ai_client = _anthropic.AsyncAnthropic(api_key=key)
-    return _ai_client
-
-async def _ai_suggest_fix(error: str, context: str) -> dict[str, Any] | None:
-    """Gọi Claude API phân tích lỗi. Trả về None nếu fail."""
-    client = _get_ai_client()
-    if not client:
-        return None
-    try:
-        import json
-        msg = await client.messages.create(
-            model      = "claude-sonnet-4-6",
-            max_tokens = 500,
-            messages   = [{
-                "role"   : "user",
-                "content": f"""Discord music bot gặp lỗi khi dùng yt-dlp:
+_AI_PROMPT = """Discord music bot gặp lỗi khi dùng yt-dlp:
 
 ERROR: {error}
 CONTEXT: {context}
@@ -76,14 +58,85 @@ Trả về JSON với format:
 }}
 
 Chỉ trả về JSON, không giải thích thêm."""
-            }],
+
+def _get_ai_client() -> "_anthropic.AsyncAnthropic | None":
+    global _ai_client
+    if _ai_client is None:
+        key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if key:
+            _ai_client = _anthropic.AsyncAnthropic(api_key=key)
+    return _ai_client
+
+async def _ai_suggest_via_anthropic(error: str, context: str) -> dict[str, Any] | None:
+    """Dùng Anthropic Claude API."""
+    client = _get_ai_client()
+    if not client:
+        return None
+    try:
+        import json
+        msg = await client.messages.create(
+            model      = "claude-sonnet-4-6",
+            max_tokens = 300,
+            messages   = [{"role": "user", "content": _AI_PROMPT.format(error=error, context=context)}],
         )
-        text = msg.content[0].text.strip()
-        text = re.sub(r"```json|```", "", text).strip()
+        text = re.sub(r"```json|```", "", msg.content[0].text).strip()
         return json.loads(text)
     except Exception as exc:
-        logger.debug("AI suggest failed: %s", exc)
+        logger.debug("Anthropic AI failed: %s", exc)
         return None
+
+async def _ai_suggest_via_openrouter(error: str, context: str) -> dict[str, Any] | None:
+    """Dùng OpenRouter free (deepseek-r1) làm fallback."""
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not key:
+        return None
+    try:
+        import json
+        async with _httpx.AsyncClient(timeout=30) as http:
+            r = await http.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type" : "application/json",
+                    "HTTP-Referer"  : "https://discord-music-bot",
+                },
+                json={
+                    "model"    : "deepseek/deepseek-r1:free",
+                    "messages" : [{"role": "user", "content": _AI_PROMPT.format(error=error, context=context)}],
+                    "max_tokens": 300,
+                },
+            )
+        data = r.json()
+        text = data["choices"][0]["message"]["content"]
+        # DeepSeek đôi khi có <think> tags — bỏ đi
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        text = re.sub(r"```json|```", "", text).strip()
+        # Lấy JSON trong text
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+    except Exception as exc:
+        logger.debug("OpenRouter AI failed: %s", exc)
+    return None
+
+async def _ai_suggest_fix(error: str, context: str) -> dict[str, Any] | None:
+    """
+    Gọi AI API phân tích lỗi và đề xuất fix runtime.
+    Thử Anthropic trước, fallback OpenRouter nếu fail.
+    """
+    # Thử Anthropic trước
+    result = await _ai_suggest_via_anthropic(error, context)
+    if result:
+        logger.info("AI (Anthropic) suggested: %s", result.get("reason", ""))
+        return result
+
+    # Fallback OpenRouter free
+    result = await _ai_suggest_via_openrouter(error, context)
+    if result:
+        logger.info("AI (OpenRouter) suggested: %s", result.get("reason", ""))
+        return result
+
+    return None
 
 # Spotify API (tuỳ chọn — chỉ dùng nếu có credentials)
 try:
