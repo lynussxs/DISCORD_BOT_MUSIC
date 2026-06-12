@@ -51,14 +51,12 @@ def _get_ai_client() -> "_anthropic.AsyncAnthropic | None":
     return _ai_client
 
 async def _ai_suggest_fix(error: str, context: str) -> dict[str, Any] | None:
-    """
-    Gọi Claude API phân tích lỗi và đề xuất fix runtime.
-    Trả về dict với các options để thử, không sửa file gốc.
-    """
+    """Gọi Claude API phân tích lỗi. Trả về None nếu fail."""
     client = _get_ai_client()
     if not client:
         return None
     try:
+        import json
         msg = await client.messages.create(
             model      = "claude-sonnet-4-6",
             max_tokens = 500,
@@ -71,21 +69,20 @@ CONTEXT: {context}
 
 Trả về JSON với format:
 {{
-  "player_clients": ["android_vr", "tv_embedded"],  // clients nên thử
-  "use_proxy": true/false,
-  "format": "bestaudio/best",  // format string
+  "player_clients": ["android_vr", "tv_embedded"],
+  "use_proxy": true,
+  "format": "bestaudio/best",
   "reason": "ngắn gọn lý do"
 }}
 
 Chỉ trả về JSON, không giải thích thêm."""
             }],
         )
-        import json
         text = msg.content[0].text.strip()
-        # Clean JSON
         text = re.sub(r"```json|```", "", text).strip()
         return json.loads(text)
-    except Exception:
+    except Exception as exc:
+        logger.debug("AI suggest failed: %s", exc)
         return None
 
 # Spotify API (tuỳ chọn — chỉ dùng nếu có credentials)
@@ -366,7 +363,10 @@ class Track:
                     continue
                 raise last_err  # type: ignore
 
-        return cls(data, requester)
+        if last_err is not None and 'data' not in dir():
+            raise last_err  # type: ignore
+
+        return cls(data, requester)  # type: ignore[possibly-undefined]
 
     @property
     def duration_str(self) -> str:
