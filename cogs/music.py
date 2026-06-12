@@ -35,6 +35,59 @@ import requests
 import time
 from typing import Any
 
+import anthropic as _anthropic
+
+# ── AI Error Handler ───────────────────────────────────────────────────────────
+# Khi bot gặp lỗi, tự gọi Claude API phân tích và thử fix runtime
+
+_ai_client: _anthropic.AsyncAnthropic | None = None
+
+def _get_ai_client() -> "_anthropic.AsyncAnthropic | None":
+    global _ai_client
+    if _ai_client is None:
+        key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if key:
+            _ai_client = _anthropic.AsyncAnthropic(api_key=key)
+    return _ai_client
+
+async def _ai_suggest_fix(error: str, context: str) -> dict[str, Any] | None:
+    """
+    Gọi Claude API phân tích lỗi và đề xuất fix runtime.
+    Trả về dict với các options để thử, không sửa file gốc.
+    """
+    client = _get_ai_client()
+    if not client:
+        return None
+    try:
+        msg = await client.messages.create(
+            model      = "claude-sonnet-4-6",
+            max_tokens = 500,
+            messages   = [{
+                "role"   : "user",
+                "content": f"""Discord music bot gặp lỗi khi dùng yt-dlp:
+
+ERROR: {error}
+CONTEXT: {context}
+
+Trả về JSON với format:
+{{
+  "player_clients": ["android_vr", "tv_embedded"],  // clients nên thử
+  "use_proxy": true/false,
+  "format": "bestaudio/best",  // format string
+  "reason": "ngắn gọn lý do"
+}}
+
+Chỉ trả về JSON, không giải thích thêm."""
+            }],
+        )
+        import json
+        text = msg.content[0].text.strip()
+        # Clean JSON
+        text = re.sub(r"```json|```", "", text).strip()
+        return json.loads(text)
+    except Exception:
+        return None
+
 # Spotify API (tuỳ chọn — chỉ dùng nếu có credentials)
 try:
     import spotipy
@@ -252,11 +305,27 @@ class Track:
         else:
             video_url = resolved
 
-        # Bước 2: Thử không proxy trước → bị chặn thì dùng proxy
+        # Bước 2: Thử không proxy trước → bị chặn thì dùng proxy → AI suggest fix
         last_err: Exception | None = None
-        for attempt in range(5):
-            use_proxy = attempt > 0  # attempt 0: không proxy, 1+: dùng proxy
-            opts = _ytdl_opts(False, use_proxy=use_proxy)
+        ai_opts: dict[str, Any] | None = None
+
+        for attempt in range(6):
+            if attempt == 5 and ai_opts is None:
+                break
+
+            if attempt == 5 and ai_opts:
+                opts = _ytdl_opts(False, use_proxy=ai_opts.get("use_proxy", True))
+                if ai_opts.get("player_clients"):
+                    opts["extractor_args"] = {
+                        "youtube": {"player_client": ai_opts["player_clients"]}
+                    }
+                if ai_opts.get("format"):
+                    opts["format"] = ai_opts["format"]
+                logger.info("AI FIX | trying: %s", ai_opts.get("reason", ""))
+            else:
+                use_proxy = attempt > 0
+                opts = _ytdl_opts(False, use_proxy=use_proxy)
+
             try:
                 with yt_dlp.YoutubeDL(opts) as ytdl:
                     partial = functools.partial(ytdl.extract_info, video_url, download=False)
@@ -266,27 +335,34 @@ class Track:
                 last_err = e
                 err_str = str(e)
 
-                # Lỗi geo-block / video bị xóa — không retry
                 if any(x in err_str for x in ["not available", "unavailable", "private", "removed"]):
                     raise last_err
 
-                # Lỗi rate limit / bot check — rotate proxy + delay
                 is_rate_limit = any(x in err_str for x in [
                     "Sign in", "bot", "Requested format", "403",
                     "Connection refused", "Connection reset", "Unable to download"
                 ])
-                if is_rate_limit and attempt < 4:
+                if is_rate_limit and attempt < 5:
                     current = opts.get("proxy", "")
                     if current:
                         _proxy.mark_dead(current, temporary=True)
-                    delay = 2 * attempt  # 0s, 2s, 4s, 6s
+                    delay = 2 * attempt
                     logger.warning(
-                        "yt-dlp attempt %d failed, waiting %ds then retry%s",
+                        "yt-dlp attempt %d failed, waiting %ds%s",
                         attempt + 1, delay,
-                        " with proxy" if attempt >= 1 else " without proxy",
+                        " (with proxy)" if attempt > 0 else " (no proxy)",
                     )
                     if delay > 0:
                         await asyncio.sleep(delay)
+
+                    # Sau attempt 3 → nhờ AI suggest fix
+                    if attempt == 3 and ai_opts is None:
+                        ai_opts = await _ai_suggest_fix(
+                            error   = err_str[:300],
+                            context = f"video_url={video_url}, proxy={'yes' if current else 'no'}",
+                        )
+                        if ai_opts:
+                            logger.info("AI suggested: %s", ai_opts.get("reason", ""))
                     continue
                 raise last_err  # type: ignore
 
