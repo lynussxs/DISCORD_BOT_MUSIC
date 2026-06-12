@@ -13,6 +13,7 @@ yt-dlp
 youtube-search-python
 requests
 spotipy
+anthropic
 # Loads .env files into os.environ
 python-dotenv>=1.0.0
 
