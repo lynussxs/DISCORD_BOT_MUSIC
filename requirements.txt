@@ -14,6 +14,7 @@ youtube-search-python
 requests
 spotipy
 anthropic
+httpx
 # Loads .env files into os.environ
 python-dotenv>=1.0.0
 
