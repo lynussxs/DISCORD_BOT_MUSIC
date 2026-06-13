@@ -1867,5 +1867,72 @@ class Music(commands.Cog):
         )
 
 
+async def _check_ai_on_startup() -> None:
+    """Kiểm tra AI models khi bot khởi động và log kết quả."""
+    import json
+
+    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    logger.info("🤖 AI HANDLER STARTUP CHECK")
+
+    # Check Anthropic
+    client = _get_ai_client()
+    if client:
+        try:
+            msg = await client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=10,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            logger.info("✅ Anthropic Claude: ONLINE")
+        except Exception as e:
+            if "credit" in str(e).lower() or "balance" in str(e).lower():
+                logger.warning("⚠️  Anthropic Claude: OUT OF CREDITS")
+            else:
+                logger.warning("❌ Anthropic Claude: %s", str(e)[:50])
+    else:
+        logger.info("⏭️  Anthropic Claude: NO API KEY")
+
+    # Check OpenRouter models
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    if key:
+        FREE_MODELS = [
+            "google/gemma-4-31b-it:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "nex-agi/nex-n2-pro:free",
+        ]
+        working = []
+        try:
+            async with _httpx.AsyncClient(timeout=10) as http:
+                for model in FREE_MODELS:
+                    try:
+                        r = await http.post(
+                            "https://openrouter.ai/api/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                            json={"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5},
+                        )
+                        short = model.split("/")[-1]
+                        if r.status_code == 200:
+                            working.append(model)
+                            logger.info("✅ OpenRouter %s: ONLINE", short)
+                        else:
+                            logger.info("❌ OpenRouter %s: %d", short, r.status_code)
+                    except Exception:
+                        logger.info("❌ OpenRouter %s: TIMEOUT", model.split("/")[-1])
+        except Exception:
+            pass
+
+        if working:
+            logger.info("🎯 Primary AI: OpenRouter/%s", working[0].split("/")[-1])
+        else:
+            logger.warning("⚠️  No OpenRouter models available!")
+    else:
+        logger.info("⏭️  OpenRouter: NO API KEY")
+
+    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Music(bot))
+    # Check AI models on startup
+    asyncio.ensure_future(_check_ai_on_startup())
