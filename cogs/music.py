@@ -101,7 +101,7 @@ async def _ai_suggest_via_openrouter(error: str, context: str) -> dict[str, Any]
                     "HTTP-Referer"  : "https://discord-music-bot",
                 },
                 json={
-                    "model"    : "deepseek/deepseek-r1:free",
+                    "model"    : "google/gemma-4-31b-it:free",
                     "messages" : [{"role": "user", "content": _AI_PROMPT.format(error=error, context=context)}],
                     "max_tokens": 300,
                 },
