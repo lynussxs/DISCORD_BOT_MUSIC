@@ -86,35 +86,53 @@ async def _ai_suggest_via_anthropic(error: str, context: str) -> dict[str, Any] 
         return None
 
 async def _ai_suggest_via_openrouter(error: str, context: str) -> dict[str, Any] | None:
-    """Dùng OpenRouter free (deepseek-r1) làm fallback."""
+    """Dùng OpenRouter free làm fallback — thử lần lượt các model."""
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         return None
+
+    # Thử lần lượt — model nào OK thì dùng
+    FREE_MODELS = [
+        "google/gemma-4-31b-it:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "nex-agi/nex-n2-pro:free",
+    ]
+
     try:
         import json
-        async with _httpx.AsyncClient(timeout=30) as http:
-            r = await http.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type" : "application/json",
-                    "HTTP-Referer"  : "https://discord-music-bot",
-                },
-                json={
-                    "model"    : "google/gemma-4-31b-it:free",
-                    "messages" : [{"role": "user", "content": _AI_PROMPT.format(error=error, context=context)}],
-                    "max_tokens": 300,
-                },
-            )
-        data = r.json()
-        text = data["choices"][0]["message"]["content"]
-        # DeepSeek đôi khi có <think> tags — bỏ đi
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        text = re.sub(r"```json|```", "", text).strip()
-        # Lấy JSON trong text
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group())
+        async with _httpx.AsyncClient(timeout=20) as http:
+            for model in FREE_MODELS:
+                try:
+                    r = await http.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Content-Type" : "application/json",
+                            "HTTP-Referer"  : "https://discord-music-bot",
+                        },
+                        json={
+                            "model"     : model,
+                            "messages"  : [{"role": "user", "content": _AI_PROMPT.format(error=error, context=context)}],
+                            "max_tokens": 300,
+                        },
+                    )
+                    if r.status_code != 200:
+                        logger.debug("OpenRouter model %s failed: %d", model, r.status_code)
+                        continue
+
+                    data = r.json()
+                    text = data["choices"][0]["message"]["content"]
+                    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+                    text = re.sub(r"```json|```", "", text).strip()
+                    match = re.search(r"\{.*\}", text, re.DOTALL)
+                    if match:
+                        result = json.loads(match.group())
+                        logger.info("AI (OpenRouter/%s) suggested: %s", model.split("/")[-1], result.get("reason", ""))
+                        return result
+                except Exception as exc:
+                    logger.debug("OpenRouter model %s error: %s", model, exc)
+                    continue
     except Exception as exc:
         logger.debug("OpenRouter AI failed: %s", exc)
     return None
