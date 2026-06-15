@@ -44,20 +44,20 @@ import httpx as _httpx  # cho OpenRouter async calls
 
 _ai_client: _anthropic.AsyncAnthropic | None = None
 
-_AI_PROMPT = """Discord music bot gặp lỗi khi dùng yt-dlp:
+_AI_PROMPT = """Discord music bot gặp lỗi yt-dlp:
 
 ERROR: {error}
 CONTEXT: {context}
 
-Trả về JSON với format:
+Trả về JSON:
 {{
-  "player_clients": ["android_vr", "tv_embedded"],
+  "player_clients": ["ios", "android", "android_vr", "tv_embedded", "web", "web_embedded"],
   "use_proxy": true,
   "format": "bestaudio/best",
-  "reason": "ngắn gọn lý do"
+  "reason": "lý do ngắn"
 }}
 
-Chỉ trả về JSON, không giải thích thêm."""
+Chỉ trả JSON, không giải thích."""
 
 def _get_ai_client() -> "_anthropic.AsyncAnthropic | None":
     global _ai_client
@@ -269,18 +269,22 @@ _proxy = WebshareProxyManager()
 
 def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     opts: dict[str, Any] = {
-        # Ưu tiên opus/webm chất lượng cao nhất cho 320kbps
         "format"          : "bestaudio[ext=webm][abr>=128]/bestaudio[ext=m4a]/bestaudio/best",
         "default_search"  : "ytsearch",
         "noplaylist"      : False,
         "quiet"           : True,
         "no_warnings"     : True,
+        "http_chunk_size" : 10485760,
+
+        # === TỐI ƯU BYPASS RATE LIMIT ===
         "extractor_args"  : {
             "youtube": {
-                "player_client": ["android_vr", "tv_embedded"],
+                "player_client": ["ios", "android", "android_vr", "tv_embedded", "web", "web_embedded"],
+                "skip"         : ["translated_subs", "dash", "hls"],
             }
         },
-        "http_chunk_size" : 10485760,  # 10MB chunks — tối ưu cho video dài
+        "geo_bypass"         : True,
+        "geo_bypass_country" : "VN",
     }
     if use_proxy:
         proxy = _proxy.get()
@@ -414,7 +418,7 @@ class Track:
                     current = opts.get("proxy", "")
                     if current:
                         _proxy.mark_dead(current, temporary=True)
-                    delay = 2 * attempt
+                    delay = min(10, 2 * attempt + 2)  # Tăng delay tránh rate limit
                     logger.warning(
                         "yt-dlp attempt %d failed, waiting %ds%s",
                         attempt + 1, delay,
@@ -1005,29 +1009,6 @@ class GuildPlayer:
                 if self._queue and not self._preloaded:
                     asyncio.ensure_future(self._preload_next(self._queue[0]))
 
-                # ── Realtime progress bar update (mỗi 15s) ────────────────────
-                async def _update_progress() -> None:
-                    while self.current == track and self.vc.is_playing():
-                        await asyncio.sleep(15)
-                        if self._np_msg and self.current == track:
-                            try:
-                                elapsed = int(time.monotonic() - self._start) if self._start else 0
-                                await self._np_msg.edit(
-                                    embed=_e_np(
-                                        track,
-                                        elapsed = elapsed,
-                                        vol_pct = round(self.volume * 100),
-                                        q_len   = len(self._queue),
-                                        paused  = self.vc.is_paused(),
-                                        loop    = self.loop,
-                                        shuffle = self.shuffle,
-                                    )
-                                )
-                            except (discord.NotFound, discord.HTTPException):
-                                break
-
-                progress_task = asyncio.ensure_future(_update_progress())
-
                 # ── Wait for track to finish — auto-refresh nếu stream đứt ────
                 self._next.clear()
                 while True:
@@ -1051,13 +1032,11 @@ class GuildPlayer:
                                 new_src = await track.make_source(self.volume, seek=elapsed)
                                 self.vc.play(new_src, after=_after)
                                 logger.info("STREAM RESUMED at %ds for '%s'", elapsed, track.title)
-                                continue
+                                continue  # tiếp tục chờ
                             except Exception as exc:
                                 logger.error("STREAM REFRESH FAILED: %s", exc)
                         break
                     break
-
-                progress_task.cancel()
 
                 # Notify if 403
                 elapsed = int(time.monotonic() - self._start) if self._start else 0
@@ -1104,19 +1083,6 @@ class GuildPlayer:
                         await self.text_ch.send(embed=e)
                     except discord.HTTPException:
                         pass
-
-                    # ── Phát nhạc nền MP3 khi hết queue ──────────────────────
-                    bg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "background.mp3")
-                    if os.path.exists(bg_path) and self.vc.is_connected():
-                        try:
-                            bg_source = discord.FFmpegOpusAudio(
-                                bg_path,
-                                options=f"-vn -filter:a volume=0.3 -b:a 64k",  # volume thấp 30%
-                            )
-                            self.vc.play(bg_source)
-                            logger.info("BG MUSIC | playing background.mp3 [guild %d]", self.vc.guild.id)
-                        except Exception as exc:
-                            logger.debug("BG MUSIC failed: %s", exc)
 
         except asyncio.CancelledError:
             pass
@@ -1970,33 +1936,7 @@ async def _check_ai_on_startup() -> None:
     logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
-async def _check_youtube_block_hours() -> None:
-    """
-    Check giờ hiện tại theo múi giờ YouTube (UTC) và cảnh báo nếu đang trong giờ cao điểm.
-    YouTube thường block datacenter IP nhiều nhất: 7h-23h UTC (14h-6h VN hôm sau).
-    """
-    import datetime
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    hour_utc = now_utc.hour
-    hour_vn  = (hour_utc + 7) % 24
-
-    # Giờ cao điểm YouTube block: 7h-23h UTC = 14h-6h VN
-    is_peak = 7 <= hour_utc <= 23
-
-    status = "🔴 CAO ĐIỂM" if is_peak else "🟢 THẤP ĐIỂM"
-    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    logger.info("🕐 YOUTUBE BLOCK TIME CHECK")
-    logger.info("   Giờ UTC: %02d:00 | Giờ VN: %02d:00", hour_utc, hour_vn)
-    logger.info("   Trạng thái: %s", status)
-    if is_peak:
-        logger.warning("   ⚠️  Giờ cao điểm — YouTube có thể chặt IP datacenter")
-        logger.warning("   ⚠️  Nếu bị lỗi 'Sign in', thử lại sau %02d:00 VN", (6 if hour_vn >= 14 else hour_vn))
-    else:
-        logger.info("   ✅ Giờ thấp điểm — YouTube ít chặn hơn")
-    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Music(bot))
+    # Check AI models on startup
     asyncio.ensure_future(_check_ai_on_startup())
-    asyncio.ensure_future(_check_youtube_block_hours())
