@@ -276,15 +276,16 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
         "no_warnings"     : True,
         "http_chunk_size" : 10485760,
 
-        # === TỐI ƯU BYPASS RATE LIMIT ===
         "extractor_args"  : {
             "youtube": {
-                "player_client": ["ios", "android", "android_vr", "tv_embedded", "web", "web_embedded"],
-                "skip"         : ["translated_subs", "dash", "hls"],
+                "player_client": ["ios", "android", "android_vr", "tv_embedded", "web", "web_embedded", "web_safari"],
+                "skip"         : ["translated_subs", "dash", "hls", "comments"],
             }
         },
         "geo_bypass"         : True,
         "geo_bypass_country" : "VN",
+        "age_limit"          : None,
+        "extractor_retries"  : 3,
     }
     if use_proxy:
         proxy = _proxy.get()
@@ -354,7 +355,16 @@ class Track:
         search rather than relying on the default_search fallback.  This
         improves result quality for artist/title searches.
         """
-        resolved = query if _URL_RE.match(query) else f"ytsearch1:{query}"
+        # Nếu là URL YouTube → extract video ID để tránh bị chặn
+        yt_id_re = re.compile(r"(?:v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})")
+        yt_match = yt_id_re.search(query)
+
+        if yt_match:
+            # Dùng video ID thay vì URL gốc
+            video_url = f"https://www.youtube.com/watch?v={yt_match.group(1)}"
+            resolved  = video_url
+        else:
+            resolved = query if _URL_RE.match(query) else f"ytsearch1:{query}"
 
         # Bước 1: Search tối giản để lấy video ID
         search_opts = {
