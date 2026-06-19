@@ -290,7 +290,16 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     if use_proxy:
         proxy = _proxy.get()
         if proxy:
+            # Đảm bảo format đúng cho yt-dlp
             opts["proxy"] = proxy
+            # Thêm header auth riêng để tránh 407
+            import urllib.parse
+            parsed = urllib.parse.urlparse(proxy)
+            if parsed.username and parsed.password:
+                opts["http_headers"] = opts.get("http_headers", {})
+                import base64
+                creds = base64.b64encode(f"{parsed.username}:{parsed.password}".encode()).decode()
+                opts["http_headers"]["Proxy-Authorization"] = f"Basic {creds}"
     if cookies:
         cp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt")
         if os.path.exists(cp):
@@ -378,6 +387,29 @@ class Track:
             partial = functools.partial(ytdl.extract_info, resolved, download=False)
             search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
 
+        # Nếu là URL YouTube → extract video ID để search thay vì dùng URL trực tiếp
+        yt_id_re = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})")
+        yt_match = yt_id_re.search(query)
+
+        if yt_match:
+            video_id = yt_match.group(1)
+            # Dùng video ID chuẩn thay vì URL gốc
+            resolved = f"https://www.youtube.com/watch?v={video_id}"
+        else:
+            resolved = query if _URL_RE.match(query) else f"ytsearch1:{query}"
+
+        # Bước 1: Search tối giản để lấy video ID
+        search_opts = {
+            "default_search" : "ytsearch",
+            "noplaylist"     : False,
+            "quiet"          : True,
+            "no_warnings"    : True,
+            "extract_flat"   : True,
+        }
+        with yt_dlp.YoutubeDL(search_opts) as ytdl:
+            partial = functools.partial(ytdl.extract_info, resolved, download=False)
+            search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
+
         if "entries" in search_data:
             entries = [e for e in search_data["entries"] if e]
             if not entries:
@@ -421,21 +453,27 @@ class Track:
                     raise last_err
 
                 is_rate_limit = any(x in err_str for x in [
-                    "Sign in", "bot", "Requested format", "403",
-                    "Connection refused", "Connection reset", "Unable to download"
+                    "Sign in", "bot", "Requested format", "403", "429",
+                    "Connection refused", "Connection reset", "Unable to download",
+                    "407", "Proxy Authentication"
                 ])
                 if is_rate_limit and attempt < 5:
                     current = opts.get("proxy", "")
-                    if current:
+                    # 407 = proxy auth fail → mark dead permanent
+                    if "407" in err_str or "Proxy Authentication" in err_str:
+                        if current:
+                            _proxy.mark_dead(current, temporary=False)
+                    elif current:
                         _proxy.mark_dead(current, temporary=True)
-                    delay = min(10, 2 * attempt + 2)  # Tăng delay tránh rate limit
+
+                    # Exponential backoff: 2s, 4s, 6s, 8s, 10s
+                    delay = min(10, 2 * (attempt + 1))
                     logger.warning(
                         "yt-dlp attempt %d failed, waiting %ds%s",
                         attempt + 1, delay,
                         " (with proxy)" if attempt > 0 else " (no proxy)",
                     )
-                    if delay > 0:
-                        await asyncio.sleep(delay)
+                    await asyncio.sleep(delay)
 
                     # Sau attempt 3 → nhờ AI suggest fix
                     if attempt == 3 and ai_opts is None:
@@ -1946,7 +1984,28 @@ async def _check_ai_on_startup() -> None:
     logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
+async def _timezone_logger() -> None:
+    """Log giờ VN và EU mỗi 5 phút để theo dõi giờ cao điểm YouTube."""
+    import datetime
+    while True:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        hour_utc = now_utc.hour
+        min_utc  = now_utc.minute
+        hour_vn  = (hour_utc + 7) % 24
+        hour_eu  = (hour_utc + 2) % 24  # CET+2 (mùa hè)
+
+        # YouTube block nặng nhất: 12h-23h UTC
+        is_peak = 12 <= hour_utc <= 23
+        status  = "🔴 CAO ĐIỂM" if is_peak else "🟢 THẤP ĐIỂM"
+
+        logger.info(
+            "🕐 VN: %02d:%02d | EU: %02d:%02d | UTC: %02d:%02d | YT: %s",
+            hour_vn, min_utc, hour_eu, min_utc, hour_utc, min_utc, status,
+        )
+        await asyncio.sleep(300)  # 5 phút
+
+
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Music(bot))
-    # Check AI models on startup
     asyncio.ensure_future(_check_ai_on_startup())
+    asyncio.ensure_future(_timezone_logger())
