@@ -17,6 +17,7 @@ requests
 spotipy
 anthropic
 httpx
+playwright>=1.40.0
 
 # Loads .env files into os.environ
 python-dotenv>=1.0.0
