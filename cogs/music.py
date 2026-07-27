@@ -1,20 +1,26 @@
 """
 cogs/music.py — Music playback cog.
-Railway Edition — Fixed 403 Forbidden, IP lock, and voice disconnect.
+VIP EDITION - YouTube BYPASS ULTIMATE
 """
+
 from __future__ import annotations
+
 import asyncio
 import functools
 import os
 import re
 import time
+import random
 from typing import Any
+
 import httpx as _httpx
 
-# ── AI Error Handler (OpenRouter only) ────────────────────────────────────────
+# ── AI Error Handler ────────────────────────────────────────────────────────
 _AI_PROMPT = """Discord music bot gặp lỗi yt-dlp:
+
 ERROR: {error}
 CONTEXT: {context}
+
 Trả về JSON:
 {{
   "player_clients": ["ios", "android", "android_vr", "tv_embedded", "web", "web_embedded"],
@@ -22,18 +28,22 @@ Trả về JSON:
   "format": "bestaudio/best",
   "reason": "lý do ngắn"
 }}
+
 Chỉ trả JSON, không giải thích."""
 
 async def _ai_suggest_via_openrouter(error: str, context: str) -> dict[str, Any] | None:
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         return None
+
     FREE_MODELS = [
         "google/gemma-4-31b-it:free",
         "nvidia/nemotron-3-ultra-550b-a55b:free",
         "nvidia/nemotron-3-super-120b-a12b:free",
         "nex-agi/nex-n2-pro:free",
+        "deepseek/deepseek-r1:free",
     ]
+
     try:
         import json
         async with _httpx.AsyncClient(timeout=20) as http:
@@ -72,6 +82,7 @@ async def _ai_suggest_via_openrouter(error: str, context: str) -> dict[str, Any]
 async def _ai_suggest_fix(error: str, context: str) -> dict[str, Any] | None:
     return await _ai_suggest_via_openrouter(error, context)
 
+# ── Spotify ──────────────────────────────────────────────────────────────────
 try:
     import spotipy
     from spotipy.oauth2 import SpotifyClientCredentials
@@ -82,46 +93,38 @@ try:
 except Exception:
     _sp_client = None
 
+# ── Discord + yt-dlp ────────────────────────────────────────────────────────
 import discord
 import yt_dlp
 from discord import app_commands
 from discord.ext import commands
+
 import config
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# ── Colours ────────────────────────────────────────────────────────────────────
 COLOUR_PLAY = 0x1DB954
 COLOUR_PAUSE = 0xF5A623
 COLOUR_STOP = 0xED4245
 COLOUR_QUEUE = 0x5865F2
 COLOUR_SUCCESS = 0x57F287
 
-# ── Webshare Proxy Manager ─────────────────────────────────────────────────────
-class WebshareProxyManager:
+# ── Proxy Manager VIP ──────────────────────────────────────────────────────
+class ProxyManagerVIP:
+    """Proxy manager with residential + fallback + auto-rotate"""
+
     PROXY_US = os.environ.get("PROXY_US", "")
-    _BRD_CRED = "c7593mkpjov5"
-    _BRD_CUSTOMER = "brd-customer-hl_3fb760f0-zone-freemium"
-    BRIGHTDATA_RESIDENTIAL = [
-        f"http://{_BRD_CUSTOMER}:{_BRD_CRED}@brd.superproxy.io:33335",
-    ]
+
     PRIORITY = [
-        *BRIGHTDATA_RESIDENTIAL,
-        *([ PROXY_US ] if PROXY_US else []),
+        # ── Residential (ưu tiên cao nhất) ──
+        "http://fywznozi:gv94cmc9t7qs@191.96.254.138:6185",
         "http://fywznozi:gv94cmc9t7qs@142.111.67.146:5611",
+        # ── Free fallback ──
         "http://34.43.46.91:80",
         "http://178.212.144.7:80",
         "http://185.135.69.34:80",
-        "http://14.186.61.187:10034",
-        "http://14.241.80.37:8080",
-        "http://27.74.219.51:30453",
-        "http://14.186.61.187:10028",
-        "http://14.186.61.187:10039",
-        "http://171.252.168.231:5109",
-        "http://116.103.93.156:16000",
-        "http://113.176.118.150:1080",
-        "http://14.181.228.19:1080",
-        "http://118.69.62.188:57140",
         "http://52.34.243.150:8080",
         "http://34.43.46.91:443",
         "http://205.215.247.164:3128",
@@ -132,52 +135,16 @@ class WebshareProxyManager:
         "http://159.65.245.255:80",
         "http://137.66.1.45:80",
         "http://23.81.87.202:8118",
-        "http://16.163.88.228:80",
-        "http://141.98.153.86:80",
-        "http://140.238.32.108:3128",
-        "http://43.167.187.233:3128",
-        "http://1.231.81.166:3128",
-        "http://182.155.254.159:80",
-        "http://47.236.86.147:443",
-        "http://138.2.83.219:3128",
-        "http://43.99.100.108:3128",
-        "http://43.167.16.253:3128",
     ]
-    ALLOWED_COUNTRIES = {"US", "JP", "DE", "SG", "HK", "KR", "TW", "NL", "FR"}
 
-    def __init__(self) -> None:
-        self.api_key = os.environ.get("WEBSHARE_API_KEY", "")
-        self._proxies: list[str] = [p for p in self.PRIORITY if p]
+    def __init__(self):
+        self._proxies = [p for p in self.PRIORITY if p]
         self._idx = 0
         self._dead: set[str] = set()
-        self._fetched = False
         self._dead_until: dict[str, float] = {}
         self._force_us = False
 
-    def _fetch_api(self) -> None:
-        if self._fetched or not self.api_key:
-            return
-        self._fetched = True
-        try:
-            import httpx
-            r = httpx.get(
-                "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=25",
-                headers={"Authorization": f"Token {self.api_key}"},
-                timeout=10,
-            )
-            if r.status_code == 200:
-                for p in r.json().get("results", []):
-                    country = p.get("country_code", "US").upper()
-                    if country not in self.ALLOWED_COUNTRIES:
-                        continue
-                    url = f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
-                    if url not in self._proxies:
-                        self._proxies.append(url)
-        except Exception:
-            pass
-
     def get(self) -> str:
-        self._fetch_api()
         now = time.monotonic()
         if self._force_us and self.PROXY_US:
             self._force_us = False
@@ -194,32 +161,26 @@ class WebshareProxyManager:
         self._idx = 0
         return self._proxies[0]
 
-    def force_us(self) -> None:
-        if self.PROXY_US:
-            self._force_us = True
-            logger.info("Forcing US proxy: %s", self.PROXY_US)
-        else:
-            logger.warning("PROXY_US chưa set!")
-
     def mark_dead(self, url: str, temporary: bool = True) -> str:
         if temporary:
-            self._dead_until[url] = time.monotonic() + 60
+            self._dead_until[url] = time.monotonic() + 30
         else:
             self._dead.add(url)
         return self.get()
 
-    def rotate(self) -> str:
-        current = self.get()
-        return self.mark_dead(current, temporary=True)
+    def force_us(self):
+        if self.PROXY_US:
+            self._force_us = True
+            logger.info("Forcing US proxy: %s", self.PROXY_US)
 
-_proxy = WebshareProxyManager()
+_proxy = ProxyManagerVIP()
 
-# ── Cookie helper ──────────────────────────────────────────────────────────────
+# ── Cookie helper ────────────────────────────────────────────────────────────
 def _cookies_valid() -> bool:
     cp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt")
     try:
         return os.path.exists(cp) and os.path.getsize(cp) > 100
-    except OSError:
+    except:
         return False
 
 def _get_cookie_file() -> str | None:
@@ -228,16 +189,16 @@ def _get_cookie_file() -> str | None:
         return cp
     return None
 
-# ── yt-dlp options ─────────────────────────────────────────────────────────────
-def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
+# ── yt-dlp options VIP ──────────────────────────────────────────────────────
+def _ytdl_opts_vip(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     cookie_file = _get_cookie_file() if cookies else None
     has_cookies = cookie_file is not None
 
-    # ── RAILWAY FIX: luôn dùng android_vr + skip dash/hls ──
-    player_clients = ["android_vr", "android", "tv_embedded"]
+    # ── VIP: luôn ưu tiên android_vr + tv_embedded ──
+    player_clients = ["android_vr", "tv_embedded", "android"]
 
     opts: dict[str, Any] = {
-        "format": "bestaudio/best/18",
+        "format": "bestaudio/best/18/140/251",
         "default_search": "ytsearch",
         "noplaylist": False,
         "quiet": True,
@@ -255,13 +216,14 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
         "geo_bypass": True,
         "geo_bypass_country": "US",
         "age_limit": None,
-        "extractor_retries": 3,
-        "socket_timeout": 15,
+        "extractor_retries": 5,
+        "socket_timeout": 20,
         "sleep_interval_requests": 2,
         "sleep_interval": 2,
         "max_sleep_interval": 5,
         "ratelimit": 5_000_000,
     }
+
     if use_proxy:
         proxy = _proxy.get()
         if proxy:
@@ -273,22 +235,23 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
                 import base64
                 creds = base64.b64encode(f"{parsed.username}:{parsed.password}".encode()).decode()
                 opts["http_headers"]["Proxy-Authorization"] = f"Basic {creds}"
+
     if cookies and cookie_file:
         opts["cookiefile"] = cookie_file
+
     return opts
 
-def _ffmpeg_before(seek: int = 0, no_proxy: bool = True, proxy_override: str | None = None) -> str:
-    probesize = "10M"
-    analyzedur = "10000000"
+# ── FFmpeg VIP (buffer siêu lớn) ──────────────────────────────────────────
+def _ffmpeg_vip(seek: int = 0, no_proxy: bool = True, proxy_override: str | None = None) -> str:
     base = (
         "-reconnect 1 "
         "-reconnect_streamed 1 "
-        "-reconnect_delay_max 5 "
+        "-reconnect_delay_max 10 "
         "-reconnect_at_eof 1 "
         "-reconnect_on_network_error 1 "
         "-reconnect_on_http_error 5xx "
-        f"-analyzeduration {analyzedur} "
-        f"-probesize {probesize} "
+        "-analyzeduration 10000000 "
+        "-probesize 10000000 "
         "-rw_timeout 60000000 "
         "-err_detect ignore_err "
         "-avioflags direct "
@@ -299,413 +262,218 @@ def _ffmpeg_before(seek: int = 0, no_proxy: bool = True, proxy_override: str | N
         base += f" -http_proxy {proxy_override}"
     return base
 
+# ── Constants ────────────────────────────────────────────────────────────────
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 def _extract_sync(opts: dict[str, Any], url: str) -> dict[str, Any]:
     with yt_dlp.YoutubeDL(opts) as ytdl:
         return ytdl.extract_info(url, download=False)
 
-# ── Piped/Invidious fallback ──────────────────────────────────────────────────
-_PIPED_FALLBACK_HARDCODED = [
+# ── Piped/Invidious fallback VIP ──────────────────────────────────────────
+_PIPED_FALLBACK = [
     "https://pipedapi.reallyaweso.me",
     "https://pipedapi.leptons.xyz",
-    "https://pipedapi.ducks.party",
-    "https://ytapi.dc09.ru",
     "https://api.piped.private.coffee",
     "https://pipedapi.smnz.de",
     "https://pipedapi.drgns.space",
-    "https://piped-api.hostux.net",
-    "https://pipedapi.r4fo.com",
-    "https://pipedapi.osphost.fi",
 ]
 
-_piped_instances_cache: list[str] | None = None
-_piped_instances_cached_at: float = 0.0
+_INVIDIOUS_FALLBACK = [
+    "https://yewtu.be",
+    "https://invidious.f5.si",
+    "https://invidious.tiekoetter.com",
+    "https://inv.nadeko.net",
+]
+
+_piped_cache: list[str] | None = None
+_piped_cached_at: float = 0.0
 
 async def _get_piped_instances(client: Any) -> list[str]:
-    global _piped_instances_cache, _piped_instances_cached_at
+    global _piped_cache, _piped_cached_at
     now = time.monotonic()
-    if _piped_instances_cache and (now - _piped_instances_cached_at) < 1800:
-        return _piped_instances_cache
+    if _piped_cache and (now - _piped_cached_at) < 1800:
+        return _piped_cache
     try:
         resp = await client.get("https://piped-instances.kavin.rocks/", timeout=6.0)
         if resp.status_code == 200:
-            instances = resp.json()
             urls = []
-            for inst in instances:
+            for inst in resp.json():
                 api_url = inst.get("api_url", "").rstrip("/")
                 if api_url and api_url.startswith("https://") and api_url not in urls:
                     urls.append(api_url)
             if urls:
-                merged = urls + [u for u in _PIPED_FALLBACK_HARDCODED if u not in urls]
-                _piped_instances_cache = merged
-                _piped_instances_cached_at = now
-                logger.info("Piped instance discovery OK — %d live + %d fallback = %d total",
-                            len(urls), len(merged) - len(urls), len(merged))
-                return merged
-    except Exception as exc:
-        logger.warning("Piped instance discovery failed: %s", exc)
-    return _PIPED_FALLBACK_HARDCODED
+                _piped_cache = urls + [u for u in _PIPED_FALLBACK if u not in urls]
+                _piped_cached_at = now
+                return _piped_cache
+    except:
+        pass
+    return _PIPED_FALLBACK
 
-_INVIDIOUS_FALLBACK_HARDCODED = [
-    "https://invidious.nerdvpn.de",
-    "https://iv.melmac.space",
-    "https://invidious.jing.rocks",
-    "https://yewtu.be",
-    "https://inv.nadeko.net",
-    "https://invidious.privacyredirect.com",
-    "https://invidious.f5.si",
-    "https://iv.ggtyler.dev",
-    "https://invidious.protokolla.fi",
-]
-
-_invidious_instances_cache: list[str] | None = None
-_invidious_instances_cached_at: float = 0.0
-
-async def _get_invidious_instances(client: Any) -> list[str]:
-    global _invidious_instances_cache, _invidious_instances_cached_at
-    now = time.monotonic()
-    if _invidious_instances_cache and (now - _invidious_instances_cached_at) < 1800:
-        return _invidious_instances_cache
-    try:
-        resp = await client.get("https://api.invidious.io/instances.json?sort_by=type,health", timeout=6.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            urls = []
-            for entry in data:
-                info = entry[1] if isinstance(entry, list) and len(entry) > 1 else {}
-                uri = (info.get("uri") or "").rstrip("/")
-                if uri and uri.startswith("https://") and uri not in urls:
-                    urls.append(uri)
-            if urls:
-                merged = urls + [u for u in _INVIDIOUS_FALLBACK_HARDCODED if u not in urls]
-                _invidious_instances_cache = merged
-                _invidious_instances_cached_at = now
-                logger.info("Invidious instance discovery OK — %d live + %d fallback = %d total",
-                            len(urls), len(merged) - len(urls), len(merged))
-                return merged
-    except Exception as exc:
-        logger.warning("Invidious instance discovery failed: %s", exc)
-    return _INVIDIOUS_FALLBACK_HARDCODED
-
-async def _invidious_fallback(video_id: str, client: Any) -> dict[str, Any] | None:
-    instances = await _get_invidious_instances(client)
-
-    async def _try_one(base: str) -> dict[str, Any] | None:
-        try:
-            resp = await client.get(f"{base}/api/v1/videos/{video_id}", timeout=6.0)
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-            formats = (data.get("adaptiveFormats") or []) + (data.get("formatStreams") or [])
-            audio_only = [f for f in formats if "audio" in f.get("type", "")] or formats
-            if not audio_only:
-                return None
-            best = max(audio_only, key=lambda f: int(f.get("bitrate", 0) or 0))
-            if not best.get("url"):
-                return None
-            logger.info("Invidious fallback OK via %s for video_id=%s", base, video_id)
-            return {
-                "id": video_id,
-                "title": data.get("title", "Unknown Title"),
-                "duration": data.get("lengthSeconds", 0),
-                "url": best["url"],
-                "thumbnail": (data.get("videoThumbnails") or [{}])[0].get("url", ""),
-                "uploader": data.get("author", "Unknown"),
-                "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
-            }
-        except Exception:
-            return None
-
-    tasks = [asyncio.create_task(_try_one(b)) for b in instances[:8]]
-    try:
+async def _piped_fallback_vip(video_id: str) -> dict[str, Any] | None:
+    import httpx
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        instances = await _get_piped_instances(client)
+        tasks = []
+        for base in instances[:8]:
+            async def try_one(b=base):
+                try:
+                    resp = await client.get(f"{b}/streams/{video_id}", timeout=6.0)
+                    if resp.status_code != 200:
+                        return None
+                    data = resp.json()
+                    streams = data.get("audioStreams") or []
+                    if not streams:
+                        return None
+                    best = max(streams, key=lambda s: s.get("bitrate", 0))
+                    if not best.get("url"):
+                        return None
+                    return {
+                        "id": video_id,
+                        "title": data.get("title", "Unknown"),
+                        "duration": data.get("duration", 0),
+                        "url": best.get("url", ""),
+                        "thumbnail": data.get("thumbnailUrl", ""),
+                        "uploader": data.get("uploader", "Unknown"),
+                        "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+                    }
+                except:
+                    return None
+            tasks.append(asyncio.create_task(try_one()))
         for coro in asyncio.as_completed(tasks, timeout=8.0):
             result = await coro
             if result:
                 for t in tasks:
                     t.cancel()
                 return result
-    except (asyncio.TimeoutError, TimeoutError):
-        pass
-    finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
     return None
 
-async def _piped_fallback(video_id: str, loop: asyncio.AbstractEventLoop) -> dict[str, Any] | None:
-    import httpx as _httpx
-    async with _httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-        instances = await _get_piped_instances(client)
-
-        async def _try_one(base: str) -> dict[str, Any] | None:
-            try:
-                resp = await client.get(f"{base}/streams/{video_id}", timeout=6.0)
-                if resp.status_code != 200:
-                    return None
-                data = resp.json()
-                audio_streams = data.get("audioStreams") or []
-                if not audio_streams:
-                    return None
-                best = max(audio_streams, key=lambda s: s.get("bitrate", 0))
-                if not best.get("url"):
-                    return None
-                logger.info("Piped fallback OK via %s for video_id=%s", base, video_id)
-                return {
-                    "id": video_id,
-                    "title": data.get("title", "Unknown Title"),
-                    "duration": data.get("duration", 0),
-                    "url": best.get("url", ""),
-                    "thumbnail": data.get("thumbnailUrl", ""),
-                    "uploader": data.get("uploader", "Unknown"),
-                    "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
-                }
-            except Exception:
-                return None
-
-        tasks = [asyncio.create_task(_try_one(b)) for b in instances[:8]]
-        result = None
-        try:
-            for coro in asyncio.as_completed(tasks, timeout=8.0):
-                r = await coro
-                if r:
-                    result = r
-                    break
-        except (asyncio.TimeoutError, TimeoutError):
-            pass
-        finally:
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-
-        if result:
-            return result
-
-        logger.warning("Piped không có kết quả cho %s, trying Invidious…", video_id)
-        return await _invidious_fallback(video_id, client)
-
-# ── Track ──────────────────────────────────────────────────────────────────────
-class Track:
+# ── Track VIP ──────────────────────────────────────────────────────────────────
+class TrackVIP:
     def __init__(self, data: dict[str, Any], requester: discord.Member | discord.User,
-                 via_proxy: bool = False, proxy_used: str | None = None) -> None:
-        self.title: str = data.get("title", "Unknown Title")
-        self.url: str = data.get("url", "")
-        self.webpage_url: str = data.get("webpage_url", self.url)
-        self.thumbnail: str | None = data.get("thumbnail")
-        self.uploader: str = data.get("uploader") or data.get("channel", "Unknown")
-        self.duration: int = int(data.get("duration") or 0)
+                 via_proxy: bool = False, proxy_used: str | None = None):
+        self.title = data.get("title", "Unknown")
+        self.url = data.get("url", "")
+        self.webpage_url = data.get("webpage_url", self.url)
+        self.thumbnail = data.get("thumbnail")
+        self.uploader = data.get("uploader") or data.get("channel", "Unknown")
+        self.duration = int(data.get("duration") or 0)
         self.requester = requester
-        self.video_id: str = data.get("id", "")
-        self._url_fetched_at: float = time.monotonic()
-        self._url_via_proxy: bool = via_proxy
-        self._proxy_used: str | None = proxy_used
+        self.video_id = data.get("id", "")
+        self._url_fetched_at = time.monotonic()
+        self._url_via_proxy = via_proxy
+        self._proxy_used = proxy_used
 
     @classmethod
-    async def from_query(cls, query: str, requester: discord.Member | discord.User,
-                         loop: asyncio.AbstractEventLoop) -> "Track":
-        yt_id_re = re.compile(r"(?:v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})")
-        yt_match = yt_id_re.search(query)
-
-        if yt_match:
-            video_url = f"https://www.youtube.com/watch?v={yt_match.group(1)}"
-            resolved = video_url
-        else:
-            resolved = query if _URL_RE.match(query) else f"ytsearch1:{query}"
-
-        search_opts = {
-            "default_search": "ytsearch",
-            "noplaylist": False,
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": True,
-        }
-        with yt_dlp.YoutubeDL(search_opts) as ytdl:
-            partial = functools.partial(ytdl.extract_info, resolved, download=False)
-            search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
-
+    async def from_query_vip(cls, query: str, requester: discord.Member | discord.User,
+                               loop: asyncio.AbstractEventLoop) -> "TrackVIP":
         yt_id_re = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})")
         yt_match = yt_id_re.search(query)
 
         if yt_match:
-            video_id = yt_match.group(1)
-            resolved = f"https://www.youtube.com/watch?v={video_id}"
+            video_url = f"https://www.youtube.com/watch?v={yt_match.group(1)}"
         else:
-            resolved = query if _URL_RE.match(query) else f"ytsearch1:{query}"
+            video_url = query if _URL_RE.match(query) else f"ytsearch1:{query}"
 
-        search_opts = {
-            "default_search": "ytsearch",
-            "noplaylist": False,
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": True,
-        }
+        # ── Step 1: Search flat ──
+        search_opts = {"default_search": "ytsearch", "noplaylist": False, "quiet": True,
+                       "no_warnings": True, "extract_flat": True}
         with yt_dlp.YoutubeDL(search_opts) as ytdl:
-            partial = functools.partial(ytdl.extract_info, resolved, download=False)
+            partial = functools.partial(ytdl.extract_info, video_url, download=False)
             search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
 
-        if "entries" in search_data:
-            entries = [e for e in search_data["entries"] if e]
-            if not entries:
-                raise ValueError(f"No results found for: {query}")
-            entry = entries[0]
-            video_url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry['id']}"
-        else:
-            video_url = resolved
+        if "entries" in search_data and search_data["entries"]:
+            entry = search_data["entries"][0]
+            if entry:
+                video_url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry['id']}"
+                video_id = entry.get("id", "")
 
-        last_err: Exception | None = None
-        ai_opts: dict[str, Any] | None = None
-        skip_ai = False
-
+        # ── Step 2: Extract full info với retry ──
+        last_err = None
         for attempt in range(5):
-            if attempt == 4 and (ai_opts is None or skip_ai):
-                break
-
-            if attempt == 4 and ai_opts and not skip_ai:
-                opts = _ytdl_opts(True, use_proxy=ai_opts.get("use_proxy", True))
-                _VALID_CLIENTS = {"ios", "android", "web", "tv", "tv_embedded", "android_vr", "web_embedded"}
-                suggested = ai_opts.get("player_clients") or []
-                safe_clients = [c for c in suggested if c in _VALID_CLIENTS]
-                if safe_clients:
-                    opts["extractor_args"]["youtube"] = {"player_client": safe_clients, "skip": ["translated_subs", "comments", "dash", "hls"]}
-                if ai_opts.get("format"):
-                    opts["format"] = ai_opts["format"]
-                logger.info("AI FIX | trying: %s", ai_opts.get("reason", ""))
+            use_proxy = (attempt == 4)
+            opts = _ytdl_opts_vip(cookies=(attempt != 3), use_proxy=use_proxy)
+            if attempt == 0:
+                opts["extractor_args"]["youtube"]["player_client"] = ["android_vr", "tv_embedded", "android"]
+            elif attempt == 1:
+                opts["extractor_args"]["youtube"]["player_client"] = ["android", "tv_embedded"]
+            elif attempt == 2:
+                opts["extractor_args"]["youtube"]["player_client"] = ["ios", "android"]
+            elif attempt == 3:
+                opts["extractor_args"]["youtube"]["player_client"] = ["web", "android_vr"]
             else:
-                use_proxy = (attempt == 3)
-                if attempt == 0:
-                    opts = _ytdl_opts(False, use_proxy=use_proxy)
-                    opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr"],
-                                                           "skip": ["translated_subs", "comments", "dash", "hls"]}
-                elif attempt == 1:
-                    opts = _ytdl_opts(True, use_proxy=use_proxy)
-                    opts["extractor_args"]["youtube"] = {"player_client": ["web"],
-                                                           "skip": ["translated_subs", "comments", "dash", "hls"]}
-                elif attempt == 2:
-                    opts = _ytdl_opts(False, use_proxy=use_proxy)
-                    opts["extractor_args"]["youtube"] = {"player_client": ["ios"],
-                                                           "skip": ["translated_subs", "comments", "dash", "hls"]}
-                else:
-                    opts = _ytdl_opts(False, use_proxy=use_proxy)
-                    opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr"],
-                                                           "skip": ["translated_subs", "comments", "dash", "hls"]}
-                logger.info("Client rotation | attempt %d → %s (proxy=%s)", attempt + 1,
-                            opts["extractor_args"]["youtube"]["player_client"],
-                            "yes" if use_proxy else "no")
+                opts["extractor_args"]["youtube"]["player_client"] = ["android_vr"]
+
+            logger.info("VIP attempt %d: %s (proxy=%s)",
+                       attempt+1, opts["extractor_args"]["youtube"]["player_client"], "yes" if use_proxy else "no")
 
             try:
-                data: dict[str, Any] = await loop.run_in_executor(None, _extract_sync, opts, video_url)
-                resolved_via_proxy = bool(opts.get("proxy"))
+                data = await loop.run_in_executor(None, _extract_sync, opts, video_url)
+                resolved_via_proxy = use_proxy
                 resolved_proxy_str = opts.get("proxy")
                 break
             except Exception as e:
                 last_err = e
                 err_str = str(e)
 
-                is_truly_unavailable = any(x in err_str for x in [
-                    "video is unavailable", "video unavailable", "this video is private",
-                    "video has been removed", "account associated with this video",
-                    "private video", "video is no longer available",
-                ]) and "format" not in err_str.lower()
-                if is_truly_unavailable:
-                    raise last_err
+                if "Sign in to confirm" in err_str or "not a bot" in err_str:
+                    logger.warning("Bot-check detected - may need fresh cookie")
+                    if not _cookies_valid():
+                        logger.error("Cookie file missing or empty!")
 
-                is_bot_check = "Sign in to confirm" in err_str or "not a bot" in err_str
-                is_rate_limit = is_bot_check or any(x in err_str for x in [
-                    "Requested format", "403", "429",
-                    "Connection refused", "Connection reset", "Unable to download",
-                    "407", "Proxy Authentication"
-                ])
+                if "Requested format" in err_str or "format not available" in err_str:
+                    logger.warning("Format error - trying next client")
 
-                if is_bot_check and not _cookies_valid():
-                    skip_ai = True
-
-                if is_rate_limit and attempt < 4:
-                    current = opts.get("proxy", "")
-                    if "407" in err_str or "Proxy Authentication" in err_str:
-                        if current:
-                            _proxy.mark_dead(current, temporary=False)
-                            if current == _proxy.PROXY_US:
-                                logger.warning("PROXY_US bị 407 — credentials sai/hết hạn!")
-                    elif current:
-                        _proxy.mark_dead(current, temporary=True)
-
-                    delay = 1.5
-                    logger.warning(
-                        "yt-dlp attempt %d failed, waiting %.1fs (proxy=%s)",
-                        attempt + 1, delay, current[-15:] if current else "none",
-                    )
-                    await asyncio.sleep(delay)
-
-                    if attempt == 3 and ai_opts is None and not skip_ai:
-                        ai_opts = await _ai_suggest_fix(
-                            error=err_str[:300],
-                            context=f"video_url={video_url}, proxy={'yes' if current else 'no'}",
-                        )
-                        if ai_opts:
-                            logger.info("AI suggested: %s", ai_opts.get("reason", ""))
+                if attempt < 4:
+                    await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 break
 
         if last_err is not None and 'data' not in dir():
+            # ── Piped fallback ──
             vid_match = re.search(r"(?:v=|/)([\w-]{11})(?:[&?/]|$)", video_url)
             if vid_match:
-                logger.warning("yt-dlp exhausted, trying Piped fallback for %s…", vid_match.group(1))
-                piped_data = await _piped_fallback(vid_match.group(1), loop)
+                logger.warning("yt-dlp exhausted, trying Piped VIP fallback...")
+                piped_data = await _piped_fallback_vip(vid_match.group(1))
                 if piped_data:
                     return cls(piped_data, requester, via_proxy=False)
 
-            err_str = str(last_err)
-            if ("Sign in to confirm" in err_str or "not a bot" in err_str) and not _cookies_valid():
-                logger.error(
-                    "Bot-check thất bại vĩnh viễn — cookies.txt thiếu/rỗng! "
-                    "Cần export cookies YouTube hợp lệ và đặt tại cookies.txt (thư mục gốc bot)."
-                )
-                raise yt_dlp.utils.DownloadError(
-                    "YouTube yêu cầu xác thực (bot-check) và bot chưa có cookies hợp lệ. "
-                    "Cần cập nhật file cookies.txt."
-                )
+            if "Sign in to confirm" in str(last_err) and not _cookies_valid():
+                raise yt_dlp.utils.DownloadError("YouTube requires cookie! Please export cookie from browser.")
             raise last_err
 
-        stream_url = data.get("url", "")
-        if "gcr=us" in stream_url and WebshareProxyManager.PROXY_US:
-            logger.info("gcr=us detected, re-fetching via US proxy for '%s'", data.get("title", "?"))
+        # ── gcr=us handling ──
+        if "gcr=us" in data.get("url", "") and _proxy.PROXY_US:
+            logger.info("gcr=us detected, re-fetching via US proxy")
             _proxy.force_us()
             try:
-                proxy_opts = _ytdl_opts(True, use_proxy=True)
+                proxy_opts = _ytdl_opts_vip(True, True)
                 data = await loop.run_in_executor(None, _extract_sync, proxy_opts, video_url)
                 resolved_via_proxy = True
                 resolved_proxy_str = proxy_opts.get("proxy")
-                logger.info("gcr=us re-fetch OK via proxy for '%s'", data.get("title", "?"))
-            except Exception as _e:
-                logger.warning("gcr=us proxy re-fetch failed: %s — will retry on stream drop", _e)
+            except Exception as e:
+                logger.warning("US proxy re-fetch failed: %s", e)
 
-        return cls(data, requester, via_proxy=resolved_via_proxy,
-                   proxy_used=resolved_proxy_str)
+        return cls(data, requester, via_proxy=resolved_via_proxy, proxy_used=resolved_proxy_str)
 
     @property
     def duration_str(self) -> str:
         h, r = divmod(self.duration, 3600)
-        m, sec = divmod(r, 60)
-        return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+        m, s = divmod(r, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
     @property
     def url_is_fresh(self) -> bool:
         return (time.monotonic() - self._url_fetched_at) < 240
 
-    async def refresh_url(self, loop: asyncio.AbstractEventLoop, force: bool = False,
-                          force_proxy: bool = False) -> None:
+    async def refresh_url_vip(self, loop: asyncio.AbstractEventLoop, force: bool = False,
+                               force_proxy: bool = False) -> None:
         if not force and self.url_is_fresh:
             return
-        last_exc: Exception | None = None
         proxy_order = (True,) if force_proxy else (False, True)
         for use_proxy in proxy_order:
             try:
-                opts = _ytdl_opts(cookies=False, use_proxy=use_proxy)
-                opts["extractor_args"] = {
-                    "youtube": {"player_client": ["android", "tv_embedded", "android_vr"],
-                                "skip": ["translated_subs", "comments", "dash", "hls"]},
-                    "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
-                }
+                opts = _ytdl_opts_vip(cookies=False, use_proxy=use_proxy)
+                opts["extractor_args"]["youtube"]["player_client"] = ["android_vr", "tv_embedded"]
                 data = await loop.run_in_executor(None, _extract_sync, opts, self.webpage_url)
                 new_url = data.get("url", "")
                 if new_url and "youtube.com/watch" not in new_url:
@@ -713,17 +481,13 @@ class Track:
                     self._url_fetched_at = time.monotonic()
                     self._url_via_proxy = use_proxy
                     self._proxy_used = opts.get("proxy")
-                    logger.info("URL refreshed (%s) for '%s'",
-                                "proxy" if use_proxy else "direct", self.title)
+                    logger.info("URL refreshed for '%s'", self.title)
                     return
-            except Exception as exc:
-                last_exc = exc
-                if not use_proxy:
-                    continue
-        if last_exc:
-            logger.warning("Failed to refresh URL for '%s': %s", self.title, last_exc)
+            except Exception:
+                continue
+        logger.warning("Failed to refresh URL for '%s'", self.title)
 
-    async def make_source(self, volume: float, seek: int = 0) -> discord.FFmpegOpusAudio:
+    async def make_source_vip(self, volume: float, seek: int = 0) -> discord.FFmpegOpusAudio:
         safe_vol = max(0.01, min(2.0, volume))
         filters = [f"volume={safe_vol:.3f}"]
         if getattr(self, '_bassboost', False):
@@ -734,15 +498,16 @@ class Track:
 
         return discord.FFmpegOpusAudio(
             self.url,
-            before_options=_ffmpeg_before(seek=seek, no_proxy=True),
-            options=f'-vn -filter:a "{filter_str}" -b:a 64k -application audio -analyzeduration 10M -probesize 10M',
+            before_options=_ffmpeg_vip(seek=seek, no_proxy=not self._url_via_proxy,
+                                        proxy_override=self._proxy_used),
+            options=f'-vn -filter:a "{filter_str}" -b:a 96k -application audio',
         )
 
 # ── Embed helpers ──────────────────────────────────────────────────────────────
 def _fmt(s: int) -> str:
     h, r = divmod(s, 3600)
-    m, sec = divmod(r, 60)
-    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 def _progress_bar(elapsed: int, total: int, length: int = 17) -> str:
     if total <= 0:
@@ -760,7 +525,7 @@ def _vol_bar(pct: int, n: int = 10) -> str:
 def _e_err(title: str, desc: str = "") -> discord.Embed:
     return discord.Embed(title=f"❌  {title}", description=desc, colour=COLOUR_STOP)
 
-def _e_np(track: Track, elapsed: int, vol_pct: int, q_len: int, paused: bool,
+def _e_np(track: TrackVIP, elapsed: int, vol_pct: int, q_len: int, paused: bool,
            loop: bool = False, shuffle: bool = False) -> discord.Embed:
     icon = "⏸" if paused else "▶️"
     colour = COLOUR_PAUSE if paused else COLOUR_PLAY
@@ -783,7 +548,7 @@ def _e_np(track: Track, elapsed: int, vol_pct: int, q_len: int, paused: bool,
     e.set_footer(text=f"🔊 Volume: {vol_pct}%  •  Queue: {q_len} track(s)")
     return e
 
-def _e_queued(track: Track, pos: int) -> discord.Embed:
+def _e_queued(track: TrackVIP, pos: int) -> discord.Embed:
     e = discord.Embed(
         title=f"🎵  Song Added to Queue #{pos}",
         description=f"[{track.title}]({track.webpage_url}) `[ {track.duration_str} ]`",
@@ -793,7 +558,7 @@ def _e_queued(track: Track, pos: int) -> discord.Embed:
 
 # ── MusicControlView ───────────────────────────────────────────────────────────
 class MusicControlView(discord.ui.View):
-    def __init__(self, player: "GuildPlayer") -> None:
+    def __init__(self, player: "GuildPlayerVIP") -> None:
         super().__init__(timeout=86_400)
         self.player = player
         self._cooldowns: dict[str, float] = {}
@@ -983,8 +748,7 @@ class MusicControlView(discord.ui.View):
     async def btn_playlist(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check_cd(interaction, "music_playlist"):
             return
-        p = self.player
-        if not p._queue:
+        p = self.player        if not p._queue:
             await interaction.response.send_message(
                 embed=discord.Embed(title="📋 Queue", description="Queue is empty!", colour=COLOUR_QUEUE),
                 ephemeral=True,
@@ -1001,8 +765,8 @@ class MusicControlView(discord.ui.View):
             ephemeral=True,
         )
 
-# ── GuildPlayer ────────────────────────────────────────────────────────────────
-class GuildPlayer:
+# ── GuildPlayer VIP ─────────────────────────────────────────────────────────────
+class GuildPlayerVIP:
     IDLE_TIMEOUT = 60
 
     def __init__(self, vc: discord.VoiceClient, text_ch: discord.abc.Messageable,
@@ -1010,16 +774,16 @@ class GuildPlayer:
         self.vc = vc
         self.text_ch = text_ch
         self._loop = loop
-        self._queue: list[Track] = []
-        self.current: Track | None = None
+        self._queue: list[TrackVIP] = []
+        self.current: TrackVIP | None = None
         self.volume: float = volume
         self.pending_resolves: int = 0
         self._start: float | None = None
         self.loop: bool = False
         self.shuffle: bool = False
         self.autoplay: bool = False
-        self._history: list[Track] = []
-        self._preloaded: Track | None = None
+        self._history: list[TrackVIP] = []
+        self._preloaded: TrackVIP | None = None
         self._old_np_msgs: list[discord.Message] = []
         self._247_mode: bool = False
         self._bassboost: bool = False
@@ -1029,7 +793,7 @@ class GuildPlayer:
         self._next: asyncio.Event = asyncio.Event()
         self._task: asyncio.Task = loop.create_task(self._player_loop())
 
-    def enqueue(self, track: Track) -> int:
+    def enqueue(self, track: TrackVIP) -> int:
         if any(t.webpage_url == track.webpage_url for t in self._queue):
             return -1
         self._queue.append(track)
@@ -1038,7 +802,7 @@ class GuildPlayer:
         return len(self._queue)
 
     @property
-    def queue(self) -> list[Track]:
+    def queue(self) -> list[TrackVIP]:
         return list(self._queue)
 
     @property
@@ -1117,13 +881,13 @@ class GuildPlayer:
                             track.title, track.duration, self.volume * 100, len(self._queue), self.vc.guild.id)
 
                 try:
-                    await track.refresh_url(self._loop)
+                    await track.refresh_url_vip(self._loop)
                     logger.info("Preloaded: '%s'", track.title)
                 except Exception as e:
                     logger.warning("Preload failed: %s", e)
 
                 try:
-                    source = await track.make_source(self.volume)
+                    source = await track.make_source_vip(self.volume)
                 except Exception as exc:
                     logger.error("SOURCE | failed for '%s': %s [guild %d]", track.title, exc, self.vc.guild.id)
                     await self.text_ch.send(
@@ -1211,11 +975,11 @@ class GuildPlayer:
                                 is_geo = "gcr=" in track.url
                                 if is_geo:
                                     _proxy.force_us()
-                                await track.refresh_url(self._loop, force=True, force_proxy=is_geo)
+                                await track.refresh_url_vip(self._loop, force=True, force_proxy=is_geo)
                                 _403_flag[0] = False
                                 _403_flag[2] = False
                                 _403_retries[0] += 1
-                                new_src = await track.make_source(self.volume, seek=elapsed)
+                                new_src = await track.make_source_vip(self.volume, seek=elapsed)
                                 self._next.clear()
                                 self.vc.play(new_src, after=_after)
                                 logger.info("STREAM RESUMED (%s attempt %d) at %ds for '%s'",
@@ -1265,9 +1029,9 @@ class GuildPlayer:
         except Exception:
             logger.exception("Unhandled error in player loop [guild %d]", self.vc.guild.id)
 
-    async def _preload_next(self, track: Track) -> None:
+    async def _preload_next(self, track: TrackVIP) -> None:
         try:
-            await track.refresh_url(self._loop)
+            await track.refresh_url_vip(self._loop)
             self._preloaded = track
             logger.debug("Pre-loaded: '%s'", track.title)
         except Exception as exc:
@@ -1301,11 +1065,11 @@ class GuildPlayer:
         self._np_msg = None
         self._np_view = None
 
-# ── Music Cog ──────────────────────────────────────────────────────────────────
-class Music(commands.Cog):
+# ── Music Cog VIP ──────────────────────────────────────────────────────────────
+class MusicVIP(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self._players: dict[int, GuildPlayer] = {}
+        self._players: dict[int, GuildPlayerVIP] = {}
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         if isinstance(error, app_commands.CommandOnCooldown):
@@ -1320,7 +1084,7 @@ class Music(commands.Cog):
             return
         logger.exception("Unhandled app command error", exc_info=error)
 
-    def _get_player(self, guild_id: int) -> GuildPlayer | None:
+    def _get_player(self, guild_id: int) -> GuildPlayerVIP | None:
         p = self._players.get(guild_id)
         if p and not p.vc.is_connected():
             del self._players[guild_id]
@@ -1421,7 +1185,7 @@ class Music(commands.Cog):
             _existing_player.pending_resolves += 1
 
         try:
-            track = await Track.from_query(query, user, self.bot.loop)
+            track = await TrackVIP.from_query_vip(query, user, self.bot.loop)
         except yt_dlp.utils.DownloadError as exc:
             logger.warning("yt-dlp DownloadError for '%s': %s", query, exc)
             exc_str = str(exc)
@@ -1449,7 +1213,7 @@ class Music(commands.Cog):
 
         player = self._get_player(guild_id)
         if player is None:
-            player = GuildPlayer(
+            player = GuildPlayerVIP(
                 vc=voice_client,
                 text_ch=interaction.channel,
                 loop=self.bot.loop,
@@ -1671,7 +1435,7 @@ class Music(commands.Cog):
         assert guild_id is not None
         player = self._get_player(guild_id)
         if player is None:
-            player = GuildPlayer(
+            player = GuildPlayerVIP(
                 vc=voice_client,
                 text_ch=interaction.channel,
                 loop=self.bot.loop,
@@ -1684,7 +1448,7 @@ class Music(commands.Cog):
         first_track = None
         for q in queries:
             try:
-                track = await Track.from_query(q, user, self.bot.loop)
+                track = await TrackVIP.from_query_vip(q, user, self.bot.loop)
                 pos = player.enqueue(track)
                 if pos != -1:
                     added += 1
@@ -1783,7 +1547,7 @@ class Music(commands.Cog):
         try:
             source = discord.FFmpegOpusAudio(
                 track.url,
-                before_options=_ffmpeg_before(seek=secs, no_proxy=True),
+                before_options=_ffmpeg_vip(seek=secs, no_proxy=True),
                 options=f"-vn -filter:a volume={safe_vol:.3f} -b:a 64k",
             )
             p.vc.stop()
@@ -1875,4 +1639,4 @@ class Music(commands.Cog):
         )
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(Music(bot))
+    await bot.add_cog(MusicVIP(bot))
