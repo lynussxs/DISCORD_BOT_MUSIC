@@ -9,12 +9,15 @@ davey>=0.1.5
 PyNaCl>=1.5.0
 
 # YouTube audio extraction and streaming
-yt-dlp
+# Ghim version mới để tránh lỗi "Requested format is not available" do YouTube
+# liên tục đổi cách trả stream (SABR/PO-Token) — bản cũ hay bị lỗi.
+yt-dlp>=2026.7.4
 youtube-search-python
 requests
 spotipy
 anthropic
 httpx
+
 # Loads .env files into os.environ
 python-dotenv>=1.0.0
 
@@ -27,3 +30,8 @@ flask>=3.0.0
 # Linux:  sudo apt install ffmpeg
 # macOS:  brew install ffmpeg
 # Replit: already installed as a system dependency
+
+# PO-Token provider plugin — cài để TẠO cấu trúc thư mục yt_dlp_plugins/extractor/.
+# bot.py sẽ tự GHI ĐÈ 3 file bên trong bằng bản khớp version với server Rust
+# (jim60105/bgutil-ytdlp-pot-provider-rs) — tránh lỗi "plugin/server version mismatch".
+bgutil-ytdlp-pot-provider
