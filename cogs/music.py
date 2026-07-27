@@ -748,7 +748,8 @@ class MusicControlView(discord.ui.View):
     async def btn_playlist(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check_cd(interaction, "music_playlist"):
             return
-        p = self.player        if not p._queue:
+        p = self.player
+        if not p._queue:
             await interaction.response.send_message(
                 embed=discord.Embed(title="📋 Queue", description="Queue is empty!", colour=COLOUR_QUEUE),
                 ephemeral=True,
