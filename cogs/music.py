@@ -767,6 +767,10 @@ class Track:
                 use_proxy = (attempt == 3)
 
                 if attempt == 0:
+                    # KHÔNG dùng cookies — ios/android/tv_embedded/android_vr là client
+                    # kiểu app-token, KHÔNG dùng session cookie. Nếu truyền cookies=True,
+                    # yt-dlp sẽ tự SKIP hẳn các client này (mất hết format), không phải
+                    # chỉ đơn thuần "thử cookie cho chắc" — đã test và xác nhận tệ hơn.
                     opts = _ytdl_opts(False, use_proxy=use_proxy)
                     opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr"],
                                                            "skip": ["translated_subs", "comments"]}
