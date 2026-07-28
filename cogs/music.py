@@ -1610,8 +1610,13 @@ class GuildPlayer:
                     asyncio.ensure_future(self._preload_next(self._queue[0]))
 
                 # ── Wait for track to finish — auto-refresh nếu stream đứt ────
-                _MAX_403_RETRY = 3
-                _MAX_EOF_RETRY = 5
+                # Giới hạn retry SCALE THEO ĐỘ DÀI bài — cap cố định (3-5 lần)
+                # quá ít cho video dài (1h+): URL YouTube tự hết hạn sau vài giờ
+                # (param expire=), và xác suất chập chờn mạng cũng cao hơn nhiều
+                # lần trong 1 phiên phát dài. +1 lượt retry mỗi 20 phút, trần 40.
+                _duration_bonus  = track.duration // 1200  # +1 mỗi 20 phút
+                _MAX_403_RETRY   = min(40, 3 + _duration_bonus)
+                _MAX_EOF_RETRY   = min(40, 5 + _duration_bonus)
                 while True:
                     await self._next.wait()
                     self._next.clear()
@@ -1682,18 +1687,14 @@ class GuildPlayer:
                 self._start  = None
                 self.current = None
 
-                # ── Thông báo hết nhạc nếu queue trống ────────────────────────
+                # ── Thông báo hết nhạc nếu queue trống — style gọn giống Lara ──
                 if not self._queue and not self.loop:
                     try:
                         e = discord.Embed(
-                            title       = "🎵 Queue Ended",
-                            description = (
-                                f"Bài cuối: **[{track.title}]({track.webpage_url})**\n\n"
-                                f"Hết nhạc rồi! Dùng `/play` để thêm bài mới."
-                            ),
+                            description = f"✅ Hết nhạc trong hàng đợi — bài cuối *{track.title}*",
                             colour      = COLOUR_QUEUE,
                         )
-                        e.set_footer(text=f"⏱ Bot sẽ tự rời sau {self.IDLE_TIMEOUT}s • Đã phát {len(self._history)} bài")
+                        e.set_footer(text=f"⏱ Bot tự rời sau {self.IDLE_TIMEOUT}s nếu không có bài mới")
                         if track.thumbnail:
                             e.set_thumbnail(url=track.thumbnail)
                         await self.text_ch.send(embed=e)
