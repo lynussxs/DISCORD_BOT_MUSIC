@@ -31,6 +31,7 @@ import asyncio
 import functools
 import os
 import re
+import threading
 import time
 from typing import Any
 
@@ -212,31 +213,58 @@ class WebshareProxyManager:
         self._idx        : int = 0
         self._dead       : set[str] = set()
         self._fetched    : bool = False
+        self._fetched_at : float = 0.0
+        self._fetching   : bool = False
         self._dead_until : dict[str, float] = {}
         self._force_us   : bool = False
 
     def _fetch_api(self) -> None:
-        """Lấy thêm proxy từ Webshare API — chỉ lấy proxy châu Á/EU."""
-        if self._fetched or not self.api_key:
+        """
+        Lấy thêm proxy từ Webshare API — chỉ lấy proxy châu Á/EU.
+        Refresh định kỳ mỗi 2 tiếng (không chỉ 1 lần lúc khởi động) — Webshare
+        có thể xoay vòng/thay đổi pool proxy của họ theo thời gian.
+
+        QUAN TRỌNG: chạy NGẦM trong thread riêng, KHÔNG block event loop.
+        Trước đây gọi httpx.get() đồng bộ ngay trong hàm này — nếu hàm bị gọi
+        từ code async (qua _proxy.get() dùng trong _ffmpeg_before chẳng hạn),
+        request mất tới 10s sẽ ĐÓNG BĂNG TOÀN BỘ event loop, chặn cả heartbeat
+        gửi Discord → đây rất có thể là nguyên nhân chính gây "Bot disconnected
+        from Discord" lặp lại nhiều lần trong log dài hạn.
+        """
+        REFRESH_INTERVAL = 7200.0  # 2 giờ
+        now = time.monotonic()
+        if not self.api_key:
             return
-        self._fetched = True
-        try:
-            import httpx
-            r = httpx.get(
-                "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=25",
-                headers={"Authorization": f"Token {self.api_key}"},
-                timeout=10,
-            )
-            if r.status_code == 200:
-                for p in r.json().get("results", []):
-                    country = p.get("country_code", "US").upper()
-                    if country not in self.ALLOWED_COUNTRIES:
-                        continue
-                    url = f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
-                    if url not in self._proxies:
-                        self._proxies.append(url)
-        except Exception:
-            pass
+        if self._fetched and (now - self._fetched_at) < REFRESH_INTERVAL:
+            return
+        if self._fetching:  # đã có 1 lần fetch đang chạy ngầm, khỏi trigger thêm
+            return
+        self._fetched    = True
+        self._fetched_at = now
+        self._fetching   = True
+
+        def _bg_fetch() -> None:
+            try:
+                import httpx
+                r = httpx.get(
+                    "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=25",
+                    headers={"Authorization": f"Token {self.api_key}"},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    for p in r.json().get("results", []):
+                        country = p.get("country_code", "US").upper()
+                        if country not in self.ALLOWED_COUNTRIES:
+                            continue
+                        url = f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
+                        if url not in self._proxies:
+                            self._proxies.append(url)
+            except Exception:
+                pass
+            finally:
+                self._fetching = False
+
+        threading.Thread(target=_bg_fetch, daemon=True, name="webshare-proxy-fetch").start()
 
     def get(self) -> str:
         self._fetch_api()
@@ -1052,11 +1080,6 @@ def _e_np(
     e.add_field(name="👤 Requested By", value=track.requester.mention, inline=True)
     e.add_field(name="⏱ Music Duration", value=f"`{track.duration_str}`", inline=True)
     e.add_field(name="🎤 Music Author", value=f"`{track.uploader}`", inline=True)
-    e.add_field(
-        name  = "Progress",
-        value = _progress_bar(elapsed, track.duration),
-        inline= False,
-    )
     flags = []
     if loop:    flags.append("🔁 Loop ON")
     if shuffle: flags.append("🔀 Shuffle ON")
@@ -1064,7 +1087,6 @@ def _e_np(
         e.add_field(name="Mode", value="  ".join(flags), inline=False)
     if track.thumbnail:
         e.set_thumbnail(url=track.thumbnail)
-    e.set_footer(text=f"🔊 Volume: {vol_pct}%  •  Queue: {q_len} track(s)")
     return e
 
 
@@ -1687,8 +1709,17 @@ class GuildPlayer:
                 self._start  = None
                 self.current = None
 
-                # ── Thông báo hết nhạc nếu queue trống — style gọn giống Lara ──
+                # ── Thông báo hết nhạc nếu queue trống — xoá hẳn MUSIC PANEL cũ,
+                #    chỉ để lại 1 thông báo gọn giống Lara (không để cả 2 cùng
+                #    hiện: panel cũ với nút đã disable + thông báo hết nhạc mới).
                 if not self._queue and not self.loop:
+                    if self._old_np_msgs:
+                        last_msg = self._old_np_msgs[-1]
+                        try:
+                            await last_msg.delete()
+                            self._old_np_msgs.remove(last_msg)
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            pass
                     try:
                         e = discord.Embed(
                             description = f"✅ Hết nhạc trong hàng đợi — bài cuối *{track.title}*",
