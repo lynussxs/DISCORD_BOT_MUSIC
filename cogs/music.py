@@ -907,7 +907,17 @@ class Track:
             logger.info("gcr=us detected, re-fetching via US proxy for '%s'", data.get("title", "?"))
             _proxy.force_us()
             try:
+                # QUAN TRỌNG: phải chỉ định LẠI đúng player_client đã thành công
+                # (android/tv_embedded/android_vr) — nếu không, _ytdl_opts() sẽ
+                # dùng client mặc định (có "web", dễ dính SABR/"Requested format
+                # is not available"). Trước đây thiếu dòng này khiến re-fetch
+                # FAIL GẦN NHƯ 100% MỌI LẦN, phải đợi tới lúc đang phát mới được
+                # sửa qua cơ chế STREAM DROP giữa chừng → gây giật ngay đầu bài.
                 proxy_opts = _ytdl_opts(True, use_proxy=True)
+                proxy_opts["extractor_args"]["youtube"] = {
+                    "player_client": ["android", "tv_embedded", "android_vr"],
+                    "skip": ["translated_subs", "comments"],
+                }
                 data = await loop.run_in_executor(None, _extract_sync, proxy_opts, video_url)
                 resolved_via_proxy = True
                 resolved_proxy_str = proxy_opts.get("proxy")
