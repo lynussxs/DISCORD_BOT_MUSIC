@@ -393,7 +393,9 @@ def _ffmpeg_before(seek: int = 0, no_proxy: bool = False, proxy_override: str | 
     base = (
         "-reconnect 1 "
         "-reconnect_streamed 1 "
-        "-reconnect_delay_max 5 "
+        "-reconnect_delay_max 2 "         # giảm từ 5s→2s: rút ngắn thời gian "đứng
+                                           # hình" tối đa mỗi lần ffmpeg tự dò kết nối
+                                           # lại gần cuối bài (reconnect_at_eof)
         "-reconnect_at_eof 1 "
         "-reconnect_on_network_error 1 "
         "-reconnect_on_http_error 5xx "   # chỉ retry 5xx, KHÔNG retry 4xx (403 = cần URL mới)
