@@ -2020,6 +2020,25 @@ class Music(commands.Cog):
             )
             self._players[guild_id] = player
 
+        # QUAN TRỌNG: xác định trạng thái "đang rảnh hay không" TRƯỚC khi
+        # enqueue() — vì enqueue() có thể đánh thức player loop gần như ngay
+        # lập tức, và nếu loop resolve xong quá nhanh (thường gặp với link
+        # trực tiếp), nó có thể chạy tới bước xoá _fetch_msg TRƯỚC KHI dòng
+        # gán player._fetch_msg bên dưới kịp chạy — dẫn đến xoá trúng None,
+        # bỏ lỡ luôn, để lại tin nhắn "Fetched" tồn tại vĩnh viễn trên chat.
+        was_idle = not (player.vc.is_playing() or player.vc.is_paused())
+        if was_idle:
+            fetch_msg = await interaction.followup.send(
+                embed=discord.Embed(
+                    title       = "🔎  Fetched",
+                    description = f"Loading **[{track.title}]({track.webpage_url})**…",
+                    colour      = COLOUR_SUCCESS,
+                )
+            )
+            # Gán NGAY trước khi enqueue() — đảm bảo player loop luôn thấy
+            # được reference này trước khi nó có cơ hội chạy tới bước xoá.
+            player._fetch_msg = fetch_msg
+
         position = player.enqueue(track)
         logger.info(
             "ENQUEUE | '%s' pos=%d queue=%d [guild %d] by %s",
@@ -2035,19 +2054,8 @@ class Music(commands.Cog):
                 ),
                 ephemeral=True,
             )
-        elif player.vc.is_playing() or player.vc.is_paused():
+        elif not was_idle:
             await interaction.followup.send(embed=_e_queued(track, position))
-        else:
-            fetch_msg = await interaction.followup.send(
-                embed=discord.Embed(
-                    title       = "🔎  Fetched",
-                    description = f"Loading **[{track.title}]({track.webpage_url})**…",
-                    colour      = COLOUR_SUCCESS,
-                )
-            )
-            # Lưu lại để player loop xoá khi MUSIC PANEL thật đã lên — tránh
-            # tin nhắn "Fetched" tạm nằm vướng víu trên chat sau khi phát xong.
-            player._fetch_msg = fetch_msg
 
     # ── /pause ─────────────────────────────────────────────────────────────────
 
@@ -2399,6 +2407,47 @@ class Music(commands.Cog):
         # Handle single track vs album/playlist
         queries = result if isinstance(result, list) else [result]
 
+        if len(queries) == 1:
+            # 1 bài: resolve trước, rồi mới quyết định gửi "Fetched" + enqueue —
+            # tránh race condition giống /play (nếu gán player._fetch_msg SAU
+            # enqueue(), player loop có thể đã chạy xong bước xoá trước đó rồi).
+            try:
+                track = await Track.from_query(queries[0], user, self.bot.loop)
+            except Exception:
+                track = None
+
+            if track is None:
+                await interaction.followup.send(
+                    embed=_e_err("Not Found", "Không tìm thấy bài nào!"), ephemeral=True,
+                )
+                return
+
+            was_idle = not (player.vc.is_playing() or player.vc.is_paused())
+            if was_idle:
+                fetch_msg = await interaction.followup.send(
+                    embed=discord.Embed(
+                        title       = "🎵 Spotify",
+                        description = f"Loading **[{track.title}]({track.webpage_url})**…",
+                        colour      = 0x1DB954,
+                    )
+                )
+                player._fetch_msg = fetch_msg
+
+            pos = player.enqueue(track)
+            if pos == -1:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title       = "⚠️ Trùng bài",
+                        description = f"**{track.title}** đã có trong queue rồi!",
+                        colour      = COLOUR_PAUSE,
+                    ),
+                    ephemeral=True,
+                )
+            elif not was_idle:
+                await interaction.followup.send(embed=_e_queued(track, pos))
+            return
+
+        # Album/Playlist — resolve nhiều bài liên tiếp
         added = 0
         first_track = None
         for q in queries:
@@ -2419,28 +2468,13 @@ class Music(commands.Cog):
             )
             return
 
-        if len(queries) == 1:
-            # Single track
-            if player.vc.is_playing() or player.vc.is_paused():
-                await interaction.followup.send(embed=_e_queued(first_track, added))
-            else:
-                fetch_msg = await interaction.followup.send(
-                    embed=discord.Embed(
-                        title       = "🎵 Spotify",
-                        description = f"Loading **[{first_track.title}]({first_track.webpage_url})**…",
-                        colour      = 0x1DB954,
-                    )
-                )
-                player._fetch_msg = fetch_msg
-        else:
-            # Album/Playlist
-            await interaction.followup.send(
-                embed=discord.Embed(
-                    title       = "🎵 Spotify Playlist",
-                    description = f"Đã thêm **{added}** bài vào queue!\nĐang phát: **{first_track.title}**",
-                    colour      = 0x1DB954,
-                ).set_thumbnail(url=first_track.thumbnail or "")
-            )
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title       = "🎵 Spotify Playlist",
+                description = f"Đã thêm **{added}** bài vào queue!\nĐang phát: **{first_track.title}**",
+                colour      = 0x1DB954,
+            ).set_thumbnail(url=first_track.thumbnail or "")
+        )
 
     async def _resolve_spotify(self, url: str) -> list[str] | str | None:
         """Convert Spotify URL → search queries cho YouTube."""
