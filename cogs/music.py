@@ -1385,6 +1385,7 @@ class GuildPlayer:
         self._history: list[Track] = []
         self._preloaded: Track | None = None      # pre-load bài tiếp
         self._old_np_msgs: list[discord.Message] = []  # NP cũ để xóa
+        self._fetch_msg: discord.Message | None = None  # "🔎 Fetched" tạm — xoá khi panel thật lên
         self._247_mode: bool       = False        # 24/7 mode
         self._bassboost: bool      = False        # bassboost effect
         self._nightcore: bool      = False        # nightcore effect
@@ -1626,6 +1627,14 @@ class GuildPlayer:
                 except discord.HTTPException as exc:
                     logger.warning("NP message failed: %s", exc)
                     self._np_msg = None
+
+                # Panel thật đã lên → xoá tin nhắn "🔎 Fetched" tạm (nếu có)
+                if self._fetch_msg is not None:
+                    try:
+                        await self._fetch_msg.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+                    self._fetch_msg = None
 
                 # ── Pre-load bài tiếp theo trong background ────────────────────
                 if self._queue and not self._preloaded:
@@ -2036,13 +2045,16 @@ class Music(commands.Cog):
         elif player.vc.is_playing() or player.vc.is_paused():
             await interaction.followup.send(embed=_e_queued(track, position))
         else:
-            await interaction.followup.send(
+            fetch_msg = await interaction.followup.send(
                 embed=discord.Embed(
                     title       = "🔎  Fetched",
                     description = f"Loading **[{track.title}]({track.webpage_url})**…",
                     colour      = COLOUR_SUCCESS,
                 )
             )
+            # Lưu lại để player loop xoá khi MUSIC PANEL thật đã lên — tránh
+            # tin nhắn "Fetched" tạm nằm vướng víu trên chat sau khi phát xong.
+            player._fetch_msg = fetch_msg
 
     # ── /pause ─────────────────────────────────────────────────────────────────
 
@@ -2419,13 +2431,14 @@ class Music(commands.Cog):
             if player.vc.is_playing() or player.vc.is_paused():
                 await interaction.followup.send(embed=_e_queued(first_track, added))
             else:
-                await interaction.followup.send(
+                fetch_msg = await interaction.followup.send(
                     embed=discord.Embed(
                         title       = "🎵 Spotify",
                         description = f"Loading **[{first_track.title}]({first_track.webpage_url})**…",
                         colour      = 0x1DB954,
                     )
                 )
+                player._fetch_msg = fetch_msg
         else:
             # Album/Playlist
             await interaction.followup.send(
