@@ -693,60 +693,50 @@ class Track:
         search rather than relying on the default_search fallback.  This
         improves result quality for artist/title searches.
         """
-        # Nếu là URL YouTube → extract video ID để tránh bị chặn
-        yt_id_re = re.compile(r"(?:v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})")
-        yt_match = yt_id_re.search(query)
-
-        if yt_match:
-            # Dùng video ID thay vì URL gốc
-            video_url = f"https://www.youtube.com/watch?v={yt_match.group(1)}"
-            resolved  = video_url
-        else:
-            resolved = query if _URL_RE.match(query) else f"ytsearch1:{query}"
-
-        # Bước 1: Search tối giản để lấy video ID
-        search_opts = {
-            "default_search" : "ytsearch",
-            "noplaylist"     : False,
-            "quiet"          : True,
-            "no_warnings"    : True,
-            "extract_flat"   : True,
-        }
-        with yt_dlp.YoutubeDL(search_opts) as ytdl:
-            partial = functools.partial(ytdl.extract_info, resolved, download=False)
-            search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
-
-        # Nếu là URL YouTube → extract video ID để search thay vì dùng URL trực tiếp
+        # Nếu là URL YouTube → extract video ID để tránh bị chặn, và QUAN TRỌNG:
+        # bỏ qua hẳn bước "search" phía dưới — ta đã có video ID rồi, không cần
+        # tìm kiếm gì nữa. Trước đây dù đã có video ID, code vẫn chạy thêm 1 (thực
+        # ra là 2, bị lặp) bước search bằng yt-dlp KHÔNG có PO-Token/cookie/client
+        # rotation nào cả — nếu bước thừa đó dính bot-check, exception văng thẳng
+        # ra ngoài, bỏ qua toàn bộ vòng lặp client rotation đáng tin cậy phía sau.
+        # Đây chính là lý do /play bằng link trực tiếp có lúc báo "Sign in to
+        # confirm..." ngay lập tức mà log không hề thấy dòng "Client rotation".
         yt_id_re = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})")
         yt_match = yt_id_re.search(query)
 
         if yt_match:
-            video_id = yt_match.group(1)
-            # Dùng video ID chuẩn thay vì URL gốc
-            resolved = f"https://www.youtube.com/watch?v={video_id}"
+            video_url = f"https://www.youtube.com/watch?v={yt_match.group(1)}"
         else:
+            # Text search — cần 1 bước tìm kiếm nhẹ để ra video_id trước khi
+            # resolve đầy đủ. Bọc try/except: nếu bước tìm kiếm này lỗi (hiếm,
+            # nhưng có thể do bot-check), KHÔNG để nó chặn toàn bộ quá trình —
+            # thử lại chính bằng "ytsearch1:<query>" trong vòng client rotation
+            # phía dưới luôn, để vẫn có cơ hội qua được nhờ PO-Token/client tốt.
             resolved = query if _URL_RE.match(query) else f"ytsearch1:{query}"
-
-        # Bước 1: Search tối giản để lấy video ID
-        search_opts = {
-            "default_search" : "ytsearch",
-            "noplaylist"     : False,
-            "quiet"          : True,
-            "no_warnings"    : True,
-            "extract_flat"   : True,
-        }
-        with yt_dlp.YoutubeDL(search_opts) as ytdl:
-            partial = functools.partial(ytdl.extract_info, resolved, download=False)
-            search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
-
-        if "entries" in search_data:
-            entries = [e for e in search_data["entries"] if e]
-            if not entries:
-                raise ValueError(f"No results found for: {query}")
-            entry = entries[0]
-            video_url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry['id']}"
-        else:
-            video_url = resolved
+            try:
+                search_opts = {
+                    "default_search" : "ytsearch",
+                    "noplaylist"     : False,
+                    "quiet"          : True,
+                    "no_warnings"    : True,
+                    "extract_flat"   : True,
+                    "socket_timeout" : 8,
+                }
+                with yt_dlp.YoutubeDL(search_opts) as ytdl:
+                    partial = functools.partial(ytdl.extract_info, resolved, download=False)
+                    search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
+                if "entries" in search_data:
+                    entries = [e for e in search_data["entries"] if e]
+                    if not entries:
+                        raise ValueError(f"No results found for: {query}")
+                    entry = entries[0]
+                    video_url = (entry.get("url") or entry.get("webpage_url")
+                                 or f"https://www.youtube.com/watch?v={entry['id']}")
+                else:
+                    video_url = resolved
+            except Exception as _search_exc:
+                logger.warning("Bước search sơ bộ lỗi (%s) — thử lại trực tiếp qua client rotation", _search_exc)
+                video_url = resolved  # để vòng client rotation tự xử lý (kể cả dạng ytsearch1:)
 
         # Bước 2: Thử không proxy trước → bị chặn thì dùng proxy → AI suggest fix
         last_err: Exception | None = None
@@ -1513,7 +1503,8 @@ class GuildPlayer:
                                     f"**{self.IDLE_TIMEOUT // 60} min** of inactivity."
                                 ),
                                 colour=COLOUR_QUEUE,
-                            )
+                            ),
+                            delete_after=8,
                         )
                         await self.vc.disconnect()
                         return
@@ -1739,7 +1730,7 @@ class GuildPlayer:
                         e.set_footer(text=f"⏱ Bot tự rời sau {self.IDLE_TIMEOUT}s nếu không có bài mới")
                         if track.thumbnail:
                             e.set_thumbnail(url=track.thumbnail)
-                        await self.text_ch.send(embed=e)
+                        await self.text_ch.send(embed=e, delete_after=8)
                     except discord.HTTPException:
                         pass
 
