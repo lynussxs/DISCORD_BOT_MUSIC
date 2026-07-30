@@ -1681,11 +1681,24 @@ class GuildPlayer:
                                 _403_flag[0] = False
                                 _403_flag[2] = False
                                 _403_retries[0] += 1
-                                new_src = await track.make_source(self.volume, seek=elapsed)
+                                # Seek lùi lại 1 giây so với elapsed thực tế — tránh
+                                # rơi đúng giữa 1 audio frame (dễ gây tiếng rè/lạ
+                                # ngay lúc chuyển tiếp, cảm giác như "phát nhanh hơn"
+                                # trong vài giây trước khi ổn định lại).
+                                seek_pos = max(0, elapsed - 1)
+                                new_src = await track.make_source(self.volume, seek=seek_pos)
                                 self._next.clear()
                                 self.vc.play(new_src, after=_after)
+                                # QUAN TRỌNG: reset lại self._start theo đúng vị trí
+                                # đang resume — quá trình refresh URL tốn vài giây
+                                # "chết" (không có tiếng) nhưng đồng hồ monotonic vẫn
+                                # chạy suốt; nếu không reset, elapsed sẽ tính lố dần
+                                # theo mỗi lần refresh, gây sai lệch cho lần retry sau
+                                # (vd kiểm tra "gần hết bài chưa" bị sai) và cả progress
+                                # bar hiển thị lệch so với audio thực tế đang nghe.
+                                self._start = time.monotonic() - seek_pos
                                 logger.info("STREAM RESUMED (%s attempt %d) at %ds for '%s'",
-                                            reason, retries + 1, elapsed, track.title)
+                                            reason, retries + 1, seek_pos, track.title)
                                 continue
                             except Exception as exc:
                                 logger.error("STREAM REFRESH FAILED: %s", exc)
