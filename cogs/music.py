@@ -731,6 +731,13 @@ async def _lavalink_ensure_player(
     member nếu chưa kết nối. Nếu bot đang kết nối bằng discord.VoiceClient
     "thường" (không phải Lavalink) và KHÔNG có gì đang phát, tự ngắt để
     kết nối lại bằng Lavalink.
+
+    QUAN TRỌNG: nếu vừa force-disconnect voice client cũ (native) rồi connect
+    lại NGAY bằng 1 VoiceProtocol khác (wavelink.Player), Discord gateway có
+    thể chưa kịp xử lý xong phiên cũ → request join mới bị "treo" cho tới khi
+    timeout (~30s) mà không có lỗi rõ ràng nào ở giữa. Nên phải tự đợi cho
+    guild.voice_client thật sự về None trước khi connect lại, thay vì chỉ
+    sleep 1 khoảng cố định ngắn.
     """
     if not _lavalink_ready():
         return None, "Lavalink node chưa sẵn sàng (chưa cấu hình hoặc mất kết nối)."
@@ -745,8 +752,11 @@ async def _lavalink_ensure_player(
         player.text_channel = text_channel
         return player, None  # type: ignore[return-value]
 
-    if isinstance(existing, discord.VoiceClient) and existing.is_connected():
-        if existing.is_playing() or existing.is_paused():
+    # Bất kỳ voice client "thường" nào còn sót lại (kể cả đã is_connected()==False
+    # nhưng vẫn còn attach vào guild) đều phải dọn sạch trước — nếu không, phiên
+    # voice cũ có thể xung đột với request join mới của Lavalink.
+    if isinstance(existing, discord.VoiceClient):
+        if existing.is_connected() and (existing.is_playing() or existing.is_paused()):
             return None, (
                 f"I'm already in <#{existing.channel.id}> phát nhạc kiểu thường. "
                 "Dùng `/stop` trước rồi thử lại để chuyển sang Lavalink."
@@ -755,17 +765,52 @@ async def _lavalink_ensure_player(
             await existing.disconnect(force=True)
         except Exception:
             pass
-        await asyncio.sleep(0.3)
 
-    try:
-        player: LavalinkPlayer = await member.voice.channel.connect(cls=LavalinkPlayer, self_deaf=True)  # type: ignore[assignment]
-        player.autoplay = wavelink.AutoPlayMode.partial  # tự phát bài kế tiếp trong queue
-        player.text_channel = text_channel
-        logger.info("LAVALINK CONNECT | joined #%s [guild %d]", member.voice.channel.name, guild.id)
-        return player, None
-    except Exception as exc:
-        logger.error("Lavalink voice connect failed: %s", exc)
-        return None, f"Không thể kết nối Lavalink vào voice channel.\n`{exc}`"
+        # Guild.voice_client thường về None gần như ngay lập tức (dọn dẹp phía
+        # client), NHƯNG điều đó không có nghĩa Discord gateway đã xử lý xong
+        # phiên voice cũ — join lại quá sớm là nguyên nhân chính gây "exceeded
+        # timeout of 30.0 seconds". Nên bắt buộc đợi thật (wall-clock), không
+        # chỉ dựa vào việc check state cục bộ.
+        await asyncio.sleep(2.0)
+        for _ in range(6):
+            if guild.voice_client is None:
+                break
+            await asyncio.sleep(0.5)
+
+    _MAX_LAVALINK_RETRY = 2
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_LAVALINK_RETRY):
+        try:
+            timeout_s = 20.0 + attempt * 10.0
+            player: LavalinkPlayer = await member.voice.channel.connect(  # type: ignore[assignment]
+                cls=LavalinkPlayer, self_deaf=True, timeout=timeout_s
+            )
+            player.autoplay = wavelink.AutoPlayMode.partial  # tự phát bài kế tiếp trong queue
+            player.text_channel = text_channel
+            logger.info(
+                "LAVALINK CONNECT | joined #%s [guild %d]%s",
+                member.voice.channel.name, guild.id, f" (attempt {attempt + 1})" if attempt else "",
+            )
+            return player, None
+        except asyncio.TimeoutError as exc:
+            last_exc = exc
+            logger.warning(
+                "Lavalink voice connect timeout (attempt %d/%d, %.0fs) — dọn dẹp rồi thử lại…",
+                attempt + 1, _MAX_LAVALINK_RETRY, timeout_s,
+            )
+            stale = guild.voice_client
+            if stale is not None:
+                try:
+                    await stale.disconnect(force=True)
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5)
+            continue
+        except Exception as exc:
+            logger.error("Lavalink voice connect failed: %s", exc)
+            return None, f"Không thể kết nối Lavalink vào voice channel.\n`{exc}`"
+
+    return None, f"Không thể kết nối Lavalink vào voice channel.\n`{last_exc}`"
 
 
 async def _lavalink_play(
