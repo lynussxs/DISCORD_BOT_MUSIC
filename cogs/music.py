@@ -375,7 +375,7 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
 def _get_ytdl_options(cookies: bool = True) -> dict[str, Any]:
     return _ytdl_opts(cookies)
 
-def _ffmpeg_before(seek: int = 0, no_proxy: bool = False, proxy_override: str | None = None) -> str:
+def _ffmpeg_before(seek: float = 0, no_proxy: bool = False, proxy_override: str | None = None) -> str:
     """
     FFmpeg input options cho YouTube stream.
     KHÔNG dùng -fflags +nobuffer hay -flags low_delay — gây crash/giật.
@@ -982,7 +982,7 @@ class Track:
         if last_exc:
             logger.warning("Failed to refresh URL for '%s': %s", self.title, last_exc)
 
-    async def make_source(self, volume: float, seek: int = 0) -> discord.FFmpegOpusAudio:
+    async def make_source(self, volume: float, seek: float = 0) -> discord.FFmpegOpusAudio:
         """
         Tạo audio source để phát.
 
@@ -1681,11 +1681,15 @@ class GuildPlayer:
                                 _403_flag[0] = False
                                 _403_flag[2] = False
                                 _403_retries[0] += 1
-                                # Seek lùi lại 1 giây so với elapsed thực tế — tránh
-                                # rơi đúng giữa 1 audio frame (dễ gây tiếng rè/lạ
-                                # ngay lúc chuyển tiếp, cảm giác như "phát nhanh hơn"
-                                # trong vài giây trước khi ổn định lại).
-                                seek_pos = max(0, elapsed - 1)
+                                # Dùng elapsed CHÍNH XÁC (có phần thập phân, không làm
+                                # tròn xuống cả giây như biến `elapsed` dùng cho log/
+                                # retry-limit ở trên) và chỉ lùi lại 0.3s — đủ để tránh
+                                # rơi giữa 1 audio frame, nhưng KHÔNG đủ dài để tai
+                                # người nhận ra là "phát lặp lại 1 đoạn" (trước dùng
+                                # nguyên 1 giây → nghe rõ như bị nhại lại 1 đoạn nhạc
+                                # vừa nghe, phản tác dụng so với mục đích ban đầu).
+                                precise_elapsed = (time.monotonic() - self._start) if self._start else 0.0
+                                seek_pos = max(0.0, precise_elapsed - 0.3)
                                 new_src = await track.make_source(self.volume, seek=seek_pos)
                                 self._next.clear()
                                 self.vc.play(new_src, after=_after)
@@ -1697,7 +1701,7 @@ class GuildPlayer:
                                 # (vd kiểm tra "gần hết bài chưa" bị sai) và cả progress
                                 # bar hiển thị lệch so với audio thực tế đang nghe.
                                 self._start = time.monotonic() - seek_pos
-                                logger.info("STREAM RESUMED (%s attempt %d) at %ds for '%s'",
+                                logger.info("STREAM RESUMED (%s attempt %d) at %.1fs for '%s'",
                                             reason, retries + 1, seek_pos, track.title)
                                 continue
                             except Exception as exc:
