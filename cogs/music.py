@@ -125,6 +125,13 @@ import yt_dlp
 from discord import app_commands
 from discord.ext import commands
 
+try:
+    import wavelink
+    _WAVELINK_AVAILABLE = True
+except ImportError:
+    wavelink = None  # type: ignore[assignment]
+    _WAVELINK_AVAILABLE = False
+
 import config
 from utils.logger import get_logger
 
@@ -650,6 +657,156 @@ def _cookies_valid() -> bool:
         return os.path.exists(cp) and os.path.getsize(cp) > 100
     except OSError:
         return False
+
+
+# ── Lavalink fallback ────────────────────────────────────────────────────────
+#
+# Khi yt-dlp bị YouTube chặn hoàn toàn (bot-check, token lỗi, "Requested
+# format is not available" ở mọi client/proxy...) — thay vì báo lỗi cho user,
+# bot chuyển sang phát qua 1 Lavalink node (server Java riêng, có plugin
+# youtube-source tự lo việc trích xuất/PoToken phía server, không dính gì
+# tới yt-dlp/cookies/proxy của bot nữa).
+#
+# Cấu hình qua biến môi trường (Railway → Variables):
+#   LAVALINK_URI       vd: http://lavalink.example.com:2333 (dùng https:// nếu node bật TLS)  (bắt buộc)
+#   LAVALINK_PASSWORD  password của node (mặc định "youshallnotpass")
+#
+# Cần cài thêm: pip install wavelink
+# Cần 1 Lavalink server đang chạy (tự host trên Railway bằng image
+# `ghcr.io/lavalink-devs/lavalink`, hoặc dùng public node có sẵn).
+#
+# Khi 1 guild đã rơi vào "chế độ Lavalink" (guild.voice_client là
+# LavalinkPlayer), các bài /play hoặc /spotify tiếp theo trong cùng guild sẽ
+# đi thẳng qua Lavalink luôn — không thử lại yt-dlp vốn đã biết là đang bị
+# chặn, đỡ tốn thời gian chờ của user.
+
+LAVALINK_URI      = os.environ.get("LAVALINK_URI", "")
+LAVALINK_PASSWORD = os.environ.get("LAVALINK_PASSWORD", "youshallnotpass")
+
+
+class LavalinkPlayer(wavelink.Player if _WAVELINK_AVAILABLE else object):  # type: ignore[misc]
+    """wavelink.Player + text channel để bot có nơi gửi 'Now playing'."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.text_channel: discord.abc.Messageable | None = None
+        self.requesters: dict[str, discord.Member | discord.User] = {}  # track identifier → requester
+
+
+async def _connect_lavalink(bot: commands.Bot) -> None:
+    """Kết nối Lavalink node lúc bot khởi động (fallback, không bắt buộc)."""
+    if not _WAVELINK_AVAILABLE:
+        logger.warning("Chưa cài `wavelink` (pip install wavelink) — Lavalink fallback sẽ KHÔNG khả dụng.")
+        return
+    if not LAVALINK_URI:
+        logger.info("LAVALINK_URI chưa được set — Lavalink fallback sẽ KHÔNG khả dụng.")
+        return
+    try:
+        node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
+        await wavelink.Pool.connect(nodes=[node], client=bot)
+        logger.info("Lavalink node connected: %s", LAVALINK_URI)
+    except Exception as exc:
+        logger.warning("Không kết nối được Lavalink node (%s): %s — fallback sẽ không khả dụng.", LAVALINK_URI, exc)
+
+
+def _lavalink_ready() -> bool:
+    """True nếu có ít nhất 1 Lavalink node đang kết nối và sẵn sàng nhận request."""
+    if not _WAVELINK_AVAILABLE:
+        return False
+    try:
+        return any(n.status == wavelink.NodeStatus.CONNECTED for n in wavelink.Pool.nodes.values())
+    except Exception:
+        return False
+
+
+def _is_lavalink_player(vc: Any) -> bool:
+    return _WAVELINK_AVAILABLE and isinstance(vc, wavelink.Player)
+
+
+async def _lavalink_ensure_player(
+    member: discord.Member, guild: discord.Guild, text_channel: discord.abc.Messageable,
+) -> tuple["LavalinkPlayer | None", str | None]:
+    """
+    Lấy (hoặc tạo mới) LavalinkPlayer cho guild — join voice channel của
+    member nếu chưa kết nối. Nếu bot đang kết nối bằng discord.VoiceClient
+    "thường" (không phải Lavalink) và KHÔNG có gì đang phát, tự ngắt để
+    kết nối lại bằng Lavalink.
+    """
+    if not _lavalink_ready():
+        return None, "Lavalink node chưa sẵn sàng (chưa cấu hình hoặc mất kết nối)."
+    if not member.voice or not member.voice.channel:
+        return None, "Join a voice channel first, then use `/play`."
+
+    existing = guild.voice_client
+    if _is_lavalink_player(existing):
+        player = existing  # type: ignore[assignment]
+        if player.channel.id != member.voice.channel.id and not player.playing:
+            await player.move_to(member.voice.channel)
+        player.text_channel = text_channel
+        return player, None  # type: ignore[return-value]
+
+    if isinstance(existing, discord.VoiceClient) and existing.is_connected():
+        if existing.is_playing() or existing.is_paused():
+            return None, (
+                f"I'm already in <#{existing.channel.id}> phát nhạc kiểu thường. "
+                "Dùng `/stop` trước rồi thử lại để chuyển sang Lavalink."
+            )
+        try:
+            await existing.disconnect(force=True)
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
+    try:
+        player: LavalinkPlayer = await member.voice.channel.connect(cls=LavalinkPlayer, self_deaf=True)  # type: ignore[assignment]
+        player.autoplay = wavelink.AutoPlayMode.partial  # tự phát bài kế tiếp trong queue
+        player.text_channel = text_channel
+        logger.info("LAVALINK CONNECT | joined #%s [guild %d]", member.voice.channel.name, guild.id)
+        return player, None
+    except Exception as exc:
+        logger.error("Lavalink voice connect failed: %s", exc)
+        return None, f"Không thể kết nối Lavalink vào voice channel.\n`{exc}`"
+
+
+async def _lavalink_play(
+    player: "LavalinkPlayer", query: str, requester: discord.Member | discord.User,
+) -> tuple["wavelink.Playable | None", bool]:
+    """
+    Tìm + phát (hoặc thêm vào queue) 1 bài qua Lavalink.
+    Trả về (track, was_queued) — was_queued=True nghĩa là đã có bài đang phát
+    nên bài mới chỉ được thêm vào cuối queue, không thay thế bài hiện tại.
+    """
+    try:
+        result = await wavelink.Playable.search(query)
+    except Exception as exc:
+        logger.warning("Lavalink search failed for '%s': %s", query, exc)
+        return None, False
+
+    if not result:
+        return None, False
+
+    track = result.tracks[0] if isinstance(result, wavelink.Playlist) else result[0]
+    track.extras = {**(track.extras or {}), "requester_id": requester.id}
+    player.requesters[track.identifier] = requester
+
+    was_queued = player.playing or player.paused
+    if was_queued:
+        await player.queue.put_wait(track)
+    else:
+        await player.play(track)
+    return track, was_queued
+
+
+def _e_lavalink_fallback_notice(query: str) -> discord.Embed:
+    return discord.Embed(
+        title       = "🛰️ Chuyển sang Lavalink",
+        description = (
+            f"YouTube trực tiếp đang chặn bot cho **{query}** — "
+            "đã tự động chuyển sang phát qua Lavalink node."
+        ),
+        colour      = COLOUR_QUEUE,
+    )
+
 
 class Track:
     """Metadata + streaming URL for one song, resolved by yt-dlp."""
@@ -1980,6 +2137,58 @@ class Music(commands.Cog):
         )
         return None
 
+    async def _play_via_lavalink(
+        self,
+        interaction: discord.Interaction,
+        query: str,
+        user: discord.Member,
+        announce_fallback: bool,
+    ) -> bool:
+        """
+        Thử phát/thêm `query` qua Lavalink. Dùng làm fallback khi yt-dlp
+        (native) bị YouTube chặn. Trả về True nếu đã tự gửi phản hồi cho
+        user (thành công HOẶC not-found qua Lavalink) — False nếu Lavalink
+        cũng không khả dụng, để caller rơi về thông báo lỗi native như cũ.
+        """
+        guild = interaction.guild
+        assert guild is not None
+
+        player, err = await _lavalink_ensure_player(user, guild, interaction.channel)  # type: ignore[arg-type]
+        if player is None:
+            if announce_fallback:
+                logger.info("Lavalink fallback không khả dụng cho '%s': %s", query, err)
+            return False
+
+        track, was_queued = await _lavalink_play(player, query, user)
+        if track is None:
+            await interaction.followup.send(
+                embed=_e_err("Not Found", f"Couldn't find anything for **{query}** (đã thử cả Lavalink)."),
+                ephemeral=True,
+            )
+            return True
+
+        if announce_fallback:
+            await interaction.followup.send(embed=_e_lavalink_fallback_notice(query))
+            logger.info("LAVALINK FALLBACK | '%s' → '%s' [guild %d]", query, track.title, guild.id)
+
+        if was_queued:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title       = "➕  Added to Queue (Lavalink)",
+                    description = f"**[{track.title}]({track.uri})**",
+                    colour      = COLOUR_QUEUE,
+                )
+            )
+        else:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title       = "🛰️  Lavalink — Now Loading",
+                    description = f"Đang phát **[{track.title}]({track.uri})**…",
+                    colour      = COLOUR_SUCCESS,
+                )
+            )
+        return True
+
     async def _resolve_and_enqueue(
         self, interaction: discord.Interaction, query: str, user: discord.Member
     ) -> None:
@@ -1988,6 +2197,18 @@ class Music(commands.Cog):
         Dùng cho /play — phát/thêm queue thẳng, không qua bước chọn nào khác.
         Yêu cầu: interaction.response đã done (defer hoặc edit_message trước đó).
         """
+        guild = interaction.guild
+        assert guild is not None
+
+        # Guild đã ở chế độ Lavalink từ 1 lần fallback trước trong session này
+        # → đi thẳng qua Lavalink luôn, khỏi tốn thời gian thử lại yt-dlp đang
+        # biết là bị chặn.
+        if _is_lavalink_player(guild.voice_client):
+            handled = await self._play_via_lavalink(interaction, query, user, announce_fallback=False)
+            if handled:
+                return
+            # Node Lavalink rớt kết nối giữa chừng → rơi về flow native bên dưới.
+
         voice_client = await self._ensure_voice(interaction)
         if voice_client is None:
             return
@@ -2003,13 +2224,16 @@ class Music(commands.Cog):
             track = await Track.from_query(query, user, self.bot.loop)
         except yt_dlp.utils.DownloadError as exc:
             logger.warning("yt-dlp DownloadError for '%s': %s", query, exc)
+            if await self._play_via_lavalink(interaction, query, user, announce_fallback=True):
+                return
             exc_str = str(exc)
             if "cookies" in exc_str.lower() or "bot-check" in exc_str.lower():
                 await interaction.followup.send(
                     embed=_e_err(
                         "YouTube yêu cầu xác thực",
                         "Bot đang bị YouTube nghi ngờ là bot và cần cookies hợp lệ để vượt qua.\n"
-                        "Admin cần cập nhật file `cookies.txt` (export cookies YouTube từ browser đã đăng nhập).",
+                        "Admin cần cập nhật file `cookies.txt` (export cookies YouTube từ browser đã đăng nhập), "
+                        "hoặc cấu hình `LAVALINK_URI` để tự động fallback.",
                     ),
                     ephemeral=True,
                 )
@@ -2025,6 +2249,8 @@ class Music(commands.Cog):
             return
         except Exception as exc:
             logger.exception("yt-dlp unexpected error for '%s'", query)
+            if await self._play_via_lavalink(interaction, query, user, announce_fallback=True):
+                return
             await interaction.followup.send(
                 embed=_e_err("Error", f"Something went wrong:\n`{exc}`"),
                 ephemeral=True,
@@ -2089,6 +2315,24 @@ class Music(commands.Cog):
     @app_commands.command(name="pause", description="Pause the current song.")
     @app_commands.guild_only()
     async def pause(self, interaction: discord.Interaction) -> None:
+        vc = interaction.guild.voice_client if interaction.guild else None  # type: ignore[union-attr]
+        if _is_lavalink_player(vc):
+            lp: LavalinkPlayer = vc  # type: ignore[assignment]
+            if not lp.current or lp.paused:
+                await interaction.response.send_message(
+                    embed=_e_err("Nothing Playing", "There's nothing to pause."), ephemeral=True,
+                )
+                return
+            await lp.pause(True)
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title       = "⏸  Paused (Lavalink)",
+                    description = f"**{lp.current.title}**",
+                    colour      = COLOUR_PAUSE,
+                )
+            )
+            return
+
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
         if not p or not p.current:
             await interaction.response.send_message(
@@ -2117,6 +2361,24 @@ class Music(commands.Cog):
     @app_commands.command(name="resume", description="Resume the paused song.")
     @app_commands.guild_only()
     async def resume(self, interaction: discord.Interaction) -> None:
+        vc = interaction.guild.voice_client if interaction.guild else None  # type: ignore[union-attr]
+        if _is_lavalink_player(vc):
+            lp: LavalinkPlayer = vc  # type: ignore[assignment]
+            if not lp.current or not lp.paused:
+                await interaction.response.send_message(
+                    embed=_e_err("Nothing Paused", "There's nothing to resume."), ephemeral=True,
+                )
+                return
+            await lp.pause(False)
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title       = "▶️  Resumed (Lavalink)",
+                    description = f"**{lp.current.title}**",
+                    colour      = COLOUR_PLAY,
+                )
+            )
+            return
+
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
         if not p or not p.current:
             await interaction.response.send_message(
@@ -2145,6 +2407,24 @@ class Music(commands.Cog):
     @app_commands.command(name="skip", description="Skip the current song.")
     @app_commands.guild_only()
     async def skip(self, interaction: discord.Interaction) -> None:
+        vc = interaction.guild.voice_client if interaction.guild else None  # type: ignore[union-attr]
+        if _is_lavalink_player(vc):
+            lp: LavalinkPlayer = vc  # type: ignore[assignment]
+            if not lp.current:
+                await interaction.response.send_message(
+                    embed=_e_err("Nothing Playing", "There's nothing to skip."), ephemeral=True,
+                )
+                return
+            skipped = lp.current.title
+            nxt = lp.queue[0].title if lp.queue else None
+            await lp.skip(force=True)
+            desc = f"Skipped **{skipped}**."
+            desc += f"\nUp next: **{nxt}**" if nxt else "\nQueue is now empty."
+            await interaction.response.send_message(
+                embed=discord.Embed(title="⏭  Skipped (Lavalink)", description=desc, colour=COLOUR_SUCCESS)
+            )
+            return
+
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
         if not p or not p.current:
             await interaction.response.send_message(
@@ -2179,15 +2459,33 @@ class Music(commands.Cog):
     async def stop(self, interaction: discord.Interaction) -> None:
         gid = interaction.guild_id
         assert gid is not None
-
-        # Lấy player HOẶC tìm bot đang trong voice
-        p = self._get_player(gid)
         guild = interaction.guild
         assert guild is not None
 
+        vc = guild.voice_client
+        if _is_lavalink_player(vc):
+            await interaction.response.defer()
+            lp: LavalinkPlayer = vc  # type: ignore[assignment]
+            try:
+                lp.queue.clear()
+                await lp.disconnect()
+            except Exception:
+                pass
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title       = "⏹  Stopped (Lavalink)",
+                    description = "Đã dừng nhạc và rời voice channel.",
+                    colour      = COLOUR_STOP,
+                )
+            )
+            logger.info("STOP | /stop (lavalink) [guild %d]", gid)
+            return
+
+        # Lấy player HOẶC tìm bot đang trong voice
+        p = self._get_player(gid)
+
         # Nếu không có player nhưng bot vẫn trong voice → disconnect luôn
         if not p:
-            vc = guild.voice_client
             if vc and isinstance(vc, discord.VoiceClient):
                 await interaction.response.defer()
                 await vc.disconnect()
@@ -2223,6 +2521,38 @@ class Music(commands.Cog):
     @app_commands.command(name="queue", description="Show the current song queue.")
     @app_commands.guild_only()
     async def queue_cmd(self, interaction: discord.Interaction) -> None:
+        vc = interaction.guild.voice_client if interaction.guild else None  # type: ignore[union-attr]
+        if _is_lavalink_player(vc):
+            lp: LavalinkPlayer = vc  # type: ignore[assignment]
+            if not lp.current and not lp.queue:
+                await interaction.response.send_message(
+                    embed=discord.Embed(
+                        title="📋  Queue is Empty (Lavalink)",
+                        description="Use `/play <song>` to add something.",
+                        colour=COLOUR_QUEUE,
+                    ),
+                    ephemeral=True,
+                )
+                return
+            lines: list[str] = []
+            if lp.current:
+                icon = "⏸" if lp.paused else "▶️"
+                lines.append(f"{icon}  **[{lp.current.title}]({lp.current.uri})**")
+            upcoming = list(lp.queue)[:10]
+            if upcoming:
+                lines.append("")
+                for i, t in enumerate(upcoming, 1):
+                    req = lp.requesters.get(t.identifier)
+                    who = req.mention if req else "?"
+                    lines.append(f"`{i:>2}.`  [{t.title}]({t.uri}) — {who}")
+            overflow = len(lp.queue) - len(upcoming)
+            if overflow > 0:
+                lines.append(f"\n*…and **{overflow}** more track(s)*")
+            embed = discord.Embed(title="📋  Queue (Lavalink)", description="\n".join(lines), colour=COLOUR_QUEUE)
+            embed.set_footer(text=f"{len(lp.queue)} track(s) waiting  •  /skip to advance")
+            await interaction.response.send_message(embed=embed)
+            return
+
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
         if not p or (not p.current and not p.queue):
             await interaction.response.send_message(
@@ -2271,6 +2601,28 @@ class Music(commands.Cog):
     @app_commands.command(name="nowplaying", description="Show detailed info about the current song.")
     @app_commands.guild_only()
     async def nowplaying(self, interaction: discord.Interaction) -> None:
+        vc = interaction.guild.voice_client if interaction.guild else None  # type: ignore[union-attr]
+        if _is_lavalink_player(vc):
+            lp: LavalinkPlayer = vc  # type: ignore[assignment]
+            if not lp.current:
+                await interaction.response.send_message(
+                    embed=_e_err("Nothing Playing", "No track is currently playing."), ephemeral=True,
+                )
+                return
+            t = lp.current
+            e = discord.Embed(colour=COLOUR_PAUSE if lp.paused else COLOUR_PLAY)
+            e.set_author(name="🎵 MUSIC PANEL (Lavalink)")
+            e.description = f"### [{t.title}]({t.uri})"
+            req = lp.requesters.get(t.identifier)
+            if req:
+                e.add_field(name="👤 Requested By", value=req.mention, inline=True)
+            e.add_field(name="🎤 Author", value=f"`{t.author}`", inline=True)
+            if t.artwork:
+                e.set_thumbnail(url=t.artwork)
+            e.set_footer(text=f"🔊 Volume: {lp.volume}%  •  Queue: {len(lp.queue)} track(s)")
+            await interaction.response.send_message(embed=e)
+            return
+
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
         if not p or not p.current:
             await interaction.response.send_message(
@@ -2299,6 +2651,20 @@ class Music(commands.Cog):
         interaction: discord.Interaction,
         level: app_commands.Range[int, 0, 100],
     ) -> None:
+        vc = interaction.guild.voice_client if interaction.guild else None  # type: ignore[union-attr]
+        if _is_lavalink_player(vc):
+            lp: LavalinkPlayer = vc  # type: ignore[assignment]
+            await lp.set_volume(level)
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title       = "🔊  Volume Updated (Lavalink)",
+                    description = _vol_bar(level),
+                    colour      = COLOUR_SUCCESS,
+                )
+            )
+            logger.info("VOLUME (lavalink) | %s → %d%% [guild %d]", interaction.user, level, interaction.guild_id)
+            return
+
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
         if not p:
             await interaction.response.send_message(
@@ -2321,6 +2687,45 @@ class Music(commands.Cog):
             )
         )
         logger.info("VOLUME | %s → %d%% [guild %d]", interaction.user, level, interaction.guild_id)
+
+    # ── Events: Lavalink (wavelink) ─────────────────────────────────────────────
+
+    if _WAVELINK_AVAILABLE:
+
+        @commands.Cog.listener()
+        async def on_wavelink_node_ready(self, payload: "wavelink.NodeReadyEventPayload") -> None:
+            logger.info("Lavalink node ready: %s (session=%s)", payload.node.uri, payload.session_id)
+
+        @commands.Cog.listener()
+        async def on_wavelink_track_start(self, payload: "wavelink.TrackStartEventPayload") -> None:
+            player: LavalinkPlayer = payload.player  # type: ignore[assignment]
+            if not isinstance(player, LavalinkPlayer) or player.text_channel is None:
+                return
+            track = payload.track
+            req = player.requesters.get(track.identifier)
+            e = discord.Embed(
+                title       = "🛰️  Now Playing (Lavalink)",
+                description = f"### [{track.title}]({track.uri})",
+                colour      = COLOUR_PLAY,
+            )
+            if req:
+                e.add_field(name="👤 Requested By", value=req.mention, inline=True)
+            e.add_field(name="🎤 Author", value=f"`{track.author}`", inline=True)
+            if track.artwork:
+                e.set_thumbnail(url=track.artwork)
+            try:
+                await player.text_channel.send(embed=e)
+            except discord.HTTPException:
+                pass
+
+        @commands.Cog.listener()
+        async def on_wavelink_inactive_player(self, player: "wavelink.Player") -> None:
+            # wavelink tự gọi khi player idle quá lâu (mặc định 10 phút, cấu hình
+            # được ở Node) — dọn dẹp/disconnect cho gọn.
+            try:
+                await player.disconnect()
+            except Exception:
+                pass
 
     # ── Event: forced disconnect ───────────────────────────────────────────────
 
@@ -2386,6 +2791,58 @@ class Music(commands.Cog):
                         self._players.pop(gid, None)
 
 
+    async def _spotify_via_lavalink(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        guild: discord.Guild,
+        queries: list[str],
+        announce_fallback: bool,
+    ) -> bool:
+        """Phát 1 hoặc nhiều query (từ Spotify) qua Lavalink. True nếu đã reply."""
+        player, err = await _lavalink_ensure_player(user, guild, interaction.channel)  # type: ignore[arg-type]
+        if player is None:
+            if announce_fallback:
+                logger.info("Lavalink fallback không khả dụng cho Spotify: %s", err)
+            return False
+
+        if announce_fallback:
+            await interaction.followup.send(embed=_e_lavalink_fallback_notice(queries[0]))
+            logger.info("LAVALINK FALLBACK | /spotify [guild %d]", guild.id)
+
+        added = 0
+        first_track = None
+        for q in queries:
+            track, _ = await _lavalink_play(player, q, user)
+            if track is not None:
+                added += 1
+                if first_track is None:
+                    first_track = track
+
+        if not first_track:
+            await interaction.followup.send(
+                embed=_e_err("Not Found", "Không tìm thấy bài nào (kể cả qua Lavalink)!"), ephemeral=True,
+            )
+            return True
+
+        if len(queries) == 1:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title       = "🛰️  Lavalink — Now Loading",
+                    description = f"Đang phát **[{first_track.title}]({first_track.uri})**…",
+                    colour      = COLOUR_SUCCESS,
+                )
+            )
+        else:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title       = "🎵 Spotify Playlist (Lavalink)",
+                    description = f"Đã thêm **{added}** bài vào queue!\nĐang phát: **{first_track.title}**",
+                    colour      = 0x1DB954,
+                )
+            )
+        return True
+
     # ── /spotify ───────────────────────────────────────────────────────────────
 
     @app_commands.command(name="spotify", description="Phát nhạc từ Spotify — track, album hoặc playlist.")
@@ -2414,10 +2871,30 @@ class Music(commands.Cog):
             )
             return
 
-        # Connect voice
+        queries = result if isinstance(result, list) else [result]
+
+        # Guild đã ở chế độ Lavalink từ 1 lần fallback trước trong session này
+        # → đi thẳng qua Lavalink, khỏi thử lại yt-dlp đang biết là bị chặn.
+        if _is_lavalink_player(guild.voice_client):
+            await self._spotify_via_lavalink(interaction, user, guild, queries, announce_fallback=False)
+            return
+
+        # Connect voice (native)
         voice_client = guild.voice_client
         if not isinstance(voice_client, discord.VoiceClient) or not voice_client.is_connected():
-            voice_client = await user.voice.channel.connect()  # type: ignore
+            try:
+                voice_client = await user.voice.channel.connect()  # type: ignore
+            except Exception as exc:
+                logger.warning("Native voice connect failed for /spotify: %s — thử Lavalink", exc)
+                voice_client = None
+
+        if voice_client is None:
+            handled = await self._spotify_via_lavalink(interaction, user, guild, queries, announce_fallback=True)
+            if not handled:
+                await interaction.followup.send(
+                    embed=_e_err("Connection Failed", "Không thể kết nối voice channel."), ephemeral=True,
+                )
+            return
 
         guild_id = interaction.guild_id
         assert guild_id is not None
@@ -2432,18 +2909,20 @@ class Music(commands.Cog):
             self._players[guild_id] = player
 
         # Handle single track vs album/playlist
-        queries = result if isinstance(result, list) else [result]
-
         if len(queries) == 1:
             # 1 bài: resolve trước, rồi mới quyết định gửi "Fetched" + enqueue —
             # tránh race condition giống /play (nếu gán player._fetch_msg SAU
             # enqueue(), player loop có thể đã chạy xong bước xoá trước đó rồi).
             try:
                 track = await Track.from_query(queries[0], user, self.bot.loop)
-            except Exception:
+            except Exception as exc:
+                logger.warning("yt-dlp lỗi cho Spotify query '%s': %s — thử Lavalink", queries[0], exc)
                 track = None
 
             if track is None:
+                handled = await self._spotify_via_lavalink(interaction, user, guild, queries, announce_fallback=True)
+                if handled:
+                    return
                 await interaction.followup.send(
                     embed=_e_err("Not Found", "Không tìm thấy bài nào!"), ephemeral=True,
                 )
@@ -2474,10 +2953,21 @@ class Music(commands.Cog):
                 await interaction.followup.send(embed=_e_queued(track, pos))
             return
 
-        # Album/Playlist — resolve nhiều bài liên tiếp
+        # Album/Playlist — resolve nhiều bài liên tiếp. Nếu 1 bài fail vì
+        # yt-dlp bị chặn, chuyển HẲN sang Lavalink cho bài đó và các bài còn
+        # lại trong playlist (khỏi lặp lại việc thử-fail native cho từng bài).
         added = 0
-        first_track = None
+        first_track: Any = None
+        lava_player: "LavalinkPlayer | None" = None
+
         for q in queries:
+            if lava_player is not None:
+                lav_track, _ = await _lavalink_play(lava_player, q, user)
+                if lav_track is not None:
+                    added += 1
+                    if first_track is None:
+                        first_track = lav_track
+                continue
             try:
                 track = await Track.from_query(q, user, self.bot.loop)
                 pos = player.enqueue(track)
@@ -2486,7 +2976,16 @@ class Music(commands.Cog):
                     if first_track is None:
                         first_track = track
             except Exception:
-                continue
+                lava_player, lav_err = await _lavalink_ensure_player(user, guild, interaction.channel)  # type: ignore[arg-type]
+                if lava_player is None:
+                    logger.info("Lavalink fallback không khả dụng cho playlist item: %s", lav_err)
+                    continue
+                logger.info("LAVALINK FALLBACK | /spotify playlist item [guild %d]", guild.id)
+                lav_track, _ = await _lavalink_play(lava_player, q, user)
+                if lav_track is not None:
+                    added += 1
+                    if first_track is None:
+                        first_track = lav_track
 
         if not first_track:
             await interaction.followup.send(
@@ -2495,12 +2994,14 @@ class Music(commands.Cog):
             )
             return
 
+        note  = "\n🛰️ *Một phần playlist được phát qua Lavalink do YouTube chặn.*" if lava_player is not None else ""
+        thumb = getattr(first_track, "thumbnail", None) or getattr(first_track, "artwork", None) or ""
         await interaction.followup.send(
             embed=discord.Embed(
                 title       = "🎵 Spotify Playlist",
-                description = f"Đã thêm **{added}** bài vào queue!\nĐang phát: **{first_track.title}**",
+                description = f"Đã thêm **{added}** bài vào queue!\nĐang phát: **{first_track.title}**{note}",
                 colour      = 0x1DB954,
-            ).set_thumbnail(url=first_track.thumbnail or "")
+            ).set_thumbnail(url=thumb)
         )
 
     async def _resolve_spotify(self, url: str) -> list[str] | str | None:
@@ -2704,3 +3205,9 @@ class Music(commands.Cog):
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Music(bot))
+    if _WAVELINK_AVAILABLE and LAVALINK_URI:
+        # Không await trực tiếp để không làm chậm/chặn quá trình load cog nếu
+        # node Lavalink chậm/không phản hồi — kết nối chạy nền, sẵn sàng khi
+        # cần fallback (nếu chưa kịp connect, /play vẫn hoạt động bình
+        # thường qua yt-dlp, chỉ là chưa có fallback ngay lập tức).
+        bot.loop.create_task(_connect_lavalink(bot))
