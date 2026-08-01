@@ -2254,9 +2254,13 @@ class Music(commands.Cog):
                 return
             # Node Lavalink rớt kết nối giữa chừng → rơi về flow native bên dưới.
 
-        voice_client = await self._ensure_voice(interaction)
-        if voice_client is None:
-            return
+        # QUAN TRỌNG: resolve track TRƯỚC, kết nối voice SAU — resolve không
+        # cần voice connection nào cả. Trước đây code connect native voice
+        # NGAY TỪ ĐẦU rồi mới thử resolve; nếu yt-dlp fail và cần fallback
+        # Lavalink, phải ngắt cái voice client native vừa tạo rồi connect lại
+        # từ đầu bằng Lavalink — tốn gấp đôi thời gian handshake (mỗi lần
+        # ~5-10s) + 2-5s sleep dọn dẹp giữa 2 lần connect. Đảo thứ tự này
+        # loại bỏ hoàn toàn phần lãng phí đó cho MỌI lần fallback.
 
         # Nếu player đã tồn tại (đang phát bài khác), báo cho nó biết có 1 lệnh
         # /play đang resolve — tránh idle-timeout đá bot ra giữa lúc bài đang
@@ -2304,6 +2308,12 @@ class Music(commands.Cog):
         finally:
             if _existing_player:
                 _existing_player.pending_resolves = max(0, _existing_player.pending_resolves - 1)
+
+        # Resolve thành công → giờ mới kết nối voice native (không lãng phí
+        # nếu chẳng may phải fallback Lavalink ở nhánh trên).
+        voice_client = await self._ensure_voice(interaction)
+        if voice_client is None:
+            return
 
         guild_id = interaction.guild_id
         assert guild_id is not None
@@ -2764,9 +2774,23 @@ class Music(commands.Cog):
                 pass
 
         @commands.Cog.listener()
+        async def on_wavelink_track_end(self, payload: "wavelink.TrackEndEventPayload") -> None:
+            # Dọn entry requester của bài vừa xong — nếu không, dict này sẽ
+            # tích luỹ vô hạn theo thời gian chạy (mỗi bài mới thêm 1 entry,
+            # không bao giờ bị xoá), gây rò rỉ bộ nhớ chậm nhưng chắc chắn
+            # trên host RAM giới hạn khi bot chạy hàng tuần/tháng liên tục.
+            player = payload.player
+            if isinstance(player, LavalinkPlayer):
+                player.requesters.pop(payload.track.identifier, None)
+
+        @commands.Cog.listener()
         async def on_wavelink_inactive_player(self, player: "wavelink.Player") -> None:
             # wavelink tự gọi khi player idle quá lâu (mặc định 10 phút, cấu hình
             # được ở Node) — dọn dẹp/disconnect cho gọn.
+            if isinstance(player, LavalinkPlayer):
+                # Xoá sạch requesters còn sót (phòng hờ nếu có track-end nào bị
+                # miss) — session coi như kết thúc hoàn toàn ở đây.
+                player.requesters.clear()
             try:
                 await player.disconnect()
             except Exception:
@@ -2793,47 +2817,81 @@ class Music(commands.Cog):
             if before.channel is None or after.channel is not None:
                 return
             p = self._players.pop(gid, None)
-            if not p:
-                return
-            p._task.cancel()
-            logger.info("DISCONNECT | force-removed from voice [guild %d]", gid)
-            if p._np_msg and p._np_view:
-                try:
-                    p._np_view._disable_all()
-                    await p._np_msg.edit(view=p._np_view)
-                except (discord.NotFound, discord.HTTPException):
-                    pass
+            if p:
+                p._task.cancel()
+                logger.info("DISCONNECT | force-removed from voice [guild %d]", gid)
+                if p._np_msg and p._np_view:
+                    try:
+                        p._np_view._disable_all()
+                        await p._np_msg.edit(view=p._np_view)
+                    except (discord.NotFound, discord.HTTPException):
+                        pass
+            else:
+                # Không có native player nhưng có thể đang ở chế độ Lavalink —
+                # trước đây bị bỏ sót hoàn toàn, không log/cleanup gì cả.
+                logger.info("DISCONNECT | force-removed from voice (lavalink) [guild %d]", gid)
             return
 
-        # ── User rời voice — kiểm tra còn ai không ────────────────────────────
+        # ── User rời voice — kiểm tra còn ai không (native player) ────────────
         p = self._players.get(gid)
-        if not p or not p.vc.is_connected():
-            return
-        # Nếu user rời khỏi channel mà bot đang ở
-        if before.channel and before.channel.id == p.vc.channel.id:
-            # Đếm số người thật (không phải bot)
-            humans = [m for m in p.vc.channel.members if not m.bot]
-            if not humans:
-                # Không còn ai → tự rời sau 1 phút
-                await asyncio.sleep(60)
-                # Kiểm tra lại
-                p2 = self._players.get(gid)
-                if p2 and p2.vc.is_connected():
-                    humans2 = [m for m in p2.vc.channel.members if not m.bot]
-                    if not humans2:
-                        logger.info("ALONE | auto-leaving empty voice [guild %d]", gid)
-                        try:
-                            await p2.text_ch.send(
-                                embed=discord.Embed(
-                                    title       = "👋  Rời kênh",
-                                    description = "Không còn ai trong kênh nên mình rời rồi nhé!",
-                                    colour      = COLOUR_QUEUE,
+        if p and p.vc.is_connected():
+            # Nếu user rời khỏi channel mà bot đang ở
+            if before.channel and before.channel.id == p.vc.channel.id:
+                # Đếm số người thật (không phải bot)
+                humans = [m for m in p.vc.channel.members if not m.bot]
+                if not humans:
+                    # Không còn ai → tự rời sau 1 phút
+                    await asyncio.sleep(60)
+                    # Kiểm tra lại
+                    p2 = self._players.get(gid)
+                    if p2 and p2.vc.is_connected():
+                        humans2 = [m for m in p2.vc.channel.members if not m.bot]
+                        if not humans2:
+                            logger.info("ALONE | auto-leaving empty voice [guild %d]", gid)
+                            try:
+                                await p2.text_ch.send(
+                                    embed=discord.Embed(
+                                        title       = "👋  Rời kênh",
+                                        description = "Không còn ai trong kênh nên mình rời rồi nhé!",
+                                        colour      = COLOUR_QUEUE,
+                                    )
                                 )
-                            )
+                            except discord.HTTPException:
+                                pass
+                            await p2.stop()
+                            self._players.pop(gid, None)
+            return
+
+        # ── User rời voice — kiểm tra còn ai không (Lavalink player) ──────────
+        # Trước đây on_voice_state_update chỉ biết tới self._players (native),
+        # nên guild đang ở "chế độ Lavalink" KHÔNG BAO GIỜ được auto-leave khi
+        # phòng trống — bot sẽ ngồi lại vĩnh viễn tới khi ai đó gõ /stop.
+        vc = guild.voice_client
+        if _is_lavalink_player(vc) and before.channel and before.channel.id == vc.channel.id:  # type: ignore[union-attr]
+            humans = [m for m in vc.channel.members if not m.bot]  # type: ignore[union-attr]
+            if not humans:
+                await asyncio.sleep(60)
+                vc2 = guild.voice_client
+                if _is_lavalink_player(vc2) and vc2.is_connected():  # type: ignore[union-attr]
+                    humans2 = [m for m in vc2.channel.members if not m.bot]  # type: ignore[union-attr]
+                    if not humans2:
+                        logger.info("ALONE | auto-leaving empty voice (lavalink) [guild %d]", gid)
+                        lp: LavalinkPlayer = vc2  # type: ignore[assignment]
+                        try:
+                            if lp.text_channel:
+                                await lp.text_channel.send(
+                                    embed=discord.Embed(
+                                        title       = "👋  Rời kênh",
+                                        description = "Không còn ai trong kênh nên mình rời rồi nhé!",
+                                        colour      = COLOUR_QUEUE,
+                                    )
+                                )
                         except discord.HTTPException:
                             pass
-                        await p2.stop()
-                        self._players.pop(gid, None)
+                        try:
+                            await lp.disconnect()
+                        except Exception:
+                            pass
 
 
     async def _spotify_via_lavalink(
@@ -2924,36 +2982,15 @@ class Music(commands.Cog):
             await self._spotify_via_lavalink(interaction, user, guild, queries, announce_fallback=False)
             return
 
-        # Connect voice (native)
-        voice_client = guild.voice_client
-        if not isinstance(voice_client, discord.VoiceClient) or not voice_client.is_connected():
-            try:
-                voice_client = await user.voice.channel.connect()  # type: ignore
-            except Exception as exc:
-                logger.warning("Native voice connect failed for /spotify: %s — thử Lavalink", exc)
-                voice_client = None
-
-        if voice_client is None:
-            handled = await self._spotify_via_lavalink(interaction, user, guild, queries, announce_fallback=True)
-            if not handled:
-                await interaction.followup.send(
-                    embed=_e_err("Connection Failed", "Không thể kết nối voice channel."), ephemeral=True,
-                )
-            return
-
         guild_id = interaction.guild_id
         assert guild_id is not None
-        player = self._get_player(guild_id)
-        if player is None:
-            player = GuildPlayer(
-                vc      = voice_client,
-                text_ch = interaction.channel,  # type: ignore[arg-type]
-                loop    = self.bot.loop,
-                volume  = config.DEFAULT_VOLUME / 100,
-            )
-            self._players[guild_id] = player
 
-        # Handle single track vs album/playlist
+        # QUAN TRỌNG: KHÔNG connect voice native vô điều kiện ở đây nữa — cùng
+        # lý do như /play: nếu track sau đó fail và phải fallback Lavalink,
+        # code cũ phải ngắt cái voice client native vừa tạo rồi connect lại
+        # từ đầu bằng Lavalink, tốn gấp đôi thời gian handshake. Giờ chỉ
+        # connect native SAU KHI biết chắc sẽ dùng tới (resolve thành công).
+
         if len(queries) == 1:
             # 1 bài: resolve trước, rồi mới quyết định gửi "Fetched" + enqueue —
             # tránh race condition giống /play (nếu gán player._fetch_msg SAU
@@ -2972,6 +3009,28 @@ class Music(commands.Cog):
                     embed=_e_err("Not Found", "Không tìm thấy bài nào!"), ephemeral=True,
                 )
                 return
+
+            # Resolve thành công → giờ mới connect voice native.
+            voice_client = guild.voice_client
+            if not isinstance(voice_client, discord.VoiceClient) or not voice_client.is_connected():
+                try:
+                    voice_client = await user.voice.channel.connect()  # type: ignore
+                except Exception as exc:
+                    await interaction.followup.send(
+                        embed=_e_err("Connection Failed", f"Không thể kết nối voice channel.\n`{exc}`"),
+                        ephemeral=True,
+                    )
+                    return
+
+            player = self._get_player(guild_id)
+            if player is None:
+                player = GuildPlayer(
+                    vc      = voice_client,
+                    text_ch = interaction.channel,  # type: ignore[arg-type]
+                    loop    = self.bot.loop,
+                    volume  = config.DEFAULT_VOLUME / 100,
+                )
+                self._players[guild_id] = player
 
             was_idle = not (player.vc.is_playing() or player.vc.is_paused())
             if was_idle:
@@ -2998,12 +3057,15 @@ class Music(commands.Cog):
                 await interaction.followup.send(embed=_e_queued(track, pos))
             return
 
-        # Album/Playlist — resolve nhiều bài liên tiếp. Nếu 1 bài fail vì
-        # yt-dlp bị chặn, chuyển HẲN sang Lavalink cho bài đó và các bài còn
-        # lại trong playlist (khỏi lặp lại việc thử-fail native cho từng bài).
+        # Album/Playlist — resolve nhiều bài liên tiếp. Voice native chỉ được
+        # connect LẦN ĐẦU khi có 1 bài resolve thành công qua yt-dlp (lazy) —
+        # nếu NGAY BÀI ĐẦU đã fail và toàn bộ playlist phải rơi về Lavalink,
+        # native voice sẽ không bao giờ được tạo ra, tránh lãng phí connect
+        # rồi lại phải ngắt.
         added = 0
         first_track: Any = None
         lava_player: "LavalinkPlayer | None" = None
+        player: "GuildPlayer | None" = self._get_player(guild_id)
 
         for q in queries:
             if lava_player is not None:
@@ -3015,6 +3077,18 @@ class Music(commands.Cog):
                 continue
             try:
                 track = await Track.from_query(q, user, self.bot.loop)
+                if player is None:
+                    # Resolve thành công lần đầu → giờ mới connect voice native.
+                    voice_client = guild.voice_client
+                    if not isinstance(voice_client, discord.VoiceClient) or not voice_client.is_connected():
+                        voice_client = await user.voice.channel.connect()  # type: ignore
+                    player = GuildPlayer(
+                        vc      = voice_client,
+                        text_ch = interaction.channel,  # type: ignore[arg-type]
+                        loop    = self.bot.loop,
+                        volume  = config.DEFAULT_VOLUME / 100,
+                    )
+                    self._players[guild_id] = player
                 pos = player.enqueue(track)
                 if pos != -1:
                     added += 1
