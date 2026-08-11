@@ -35,79 +35,7 @@ import threading
 import time
 from typing import Any
 
-import httpx as _httpx  # cho OpenRouter async calls
-
-# ── AI Error Handler (OpenRouter only) ────────────────────────────────────────
-
-_AI_PROMPT = """Discord music bot gặp lỗi yt-dlp:
-
-ERROR: {error}
-CONTEXT: {context}
-
-Trả về JSON:
-{{
-  "player_clients": ["ios", "android", "android_vr", "tv_embedded", "web", "web_embedded"],
-  "use_proxy": true,
-  "format": "bestaudio/best",
-  "reason": "lý do ngắn"
-}}
-
-Chỉ trả JSON, không giải thích."""
-
-async def _ai_suggest_via_openrouter(error: str, context: str) -> dict[str, Any] | None:
-    """Dùng OpenRouter free — thử lần lượt các model."""
-    key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not key:
-        return None
-
-    FREE_MODELS = [
-        "google/gemma-4-31b-it:free",
-        "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "nvidia/nemotron-3-super-120b-a12b:free",
-        "nex-agi/nex-n2-pro:free",
-    ]
-
-    try:
-        import json
-        async with _httpx.AsyncClient(timeout=20) as http:
-            for model in FREE_MODELS:
-                try:
-                    r = await http.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {key}",
-                            "Content-Type" : "application/json",
-                            "HTTP-Referer"  : "https://discord-music-bot",
-                        },
-                        json={
-                            "model"     : model,
-                            "messages"  : [{"role": "user", "content": _AI_PROMPT.format(error=error, context=context)}],
-                            "max_tokens": 300,
-                        },
-                    )
-                    if r.status_code != 200:
-                        logger.debug("OpenRouter model %s failed: %d", model, r.status_code)
-                        continue
-
-                    data = r.json()
-                    text = data["choices"][0]["message"]["content"]
-                    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-                    text = re.sub(r"```json|```", "", text).strip()
-                    match = re.search(r"\{.*\}", text, re.DOTALL)
-                    if match:
-                        result = json.loads(match.group())
-                        logger.info("AI (OpenRouter/%s) suggested: %s", model.split("/")[-1], result.get("reason", ""))
-                        return result
-                except Exception as exc:
-                    logger.debug("OpenRouter model %s error: %s", model, exc)
-                    continue
-    except Exception as exc:
-        logger.debug("OpenRouter AI failed: %s", exc)
-    return None
-
-async def _ai_suggest_fix(error: str, context: str) -> dict[str, Any] | None:
-    """Gọi OpenRouter để suggest fix khi yt-dlp thất bại."""
-    return await _ai_suggest_via_openrouter(error, context)
+import httpx as _httpx  # dùng cho Piped/Invidious fallback async calls
 
 # Spotify API (tuỳ chọn — chỉ dùng nếu có credentials)
 try:
@@ -461,21 +389,27 @@ async def _get_piped_instances(client: "Any") -> list[str]:
         resp = await client.get("https://piped-instances.kavin.rocks/", timeout=6.0)
         if resp.status_code == 200:
             instances = resp.json()
-            # Mỗi entry có "api_url" — lọc lấy https, bỏ trùng
-            urls = []
-            for inst in instances:
-                api_url = inst.get("api_url", "").rstrip("/")
-                if api_url and api_url.startswith("https://") and api_url not in urls:
-                    urls.append(api_url)
-            if urls:
-                # Gộp thêm danh sách dự phòng cứng — tăng tổng số lựa chọn thay vì chỉ
-                # dùng discovery đơn thuần (có thể trả về rất ít do API không ổn định).
-                merged = urls + [u for u in _PIPED_FALLBACK_HARDCODED if u not in urls]
-                _piped_instances_cache = merged
-                _piped_instances_cached_at = now
-                logger.info("Piped instance discovery OK — %d live + %d fallback = %d total",
-                            len(urls), len(merged) - len(urls), len(merged))
-                return merged
+            # QUAN TRỌNG: API có lúc trả về None/dict lỗi thay vì list (server-side
+            # issue hoặc rate-limit trả về body khác dạng) — kiểm tra kiểu trước khi
+            # iterate, tránh crash "'NoneType' object is not iterable".
+            if isinstance(instances, list):
+                # Mỗi entry có "api_url" — lọc lấy https, bỏ trùng
+                urls = []
+                for inst in instances:
+                    if not isinstance(inst, dict):
+                        continue
+                    api_url = inst.get("api_url", "").rstrip("/")
+                    if api_url and api_url.startswith("https://") and api_url not in urls:
+                        urls.append(api_url)
+                if urls:
+                    # Gộp thêm danh sách dự phòng cứng — tăng tổng số lựa chọn thay vì chỉ
+                    # dùng discovery đơn thuần (có thể trả về rất ít do API không ổn định).
+                    merged = urls + [u for u in _PIPED_FALLBACK_HARDCODED if u not in urls]
+                    _piped_instances_cache = merged
+                    _piped_instances_cached_at = now
+                    logger.info("Piped instance discovery OK — %d live + %d fallback = %d total",
+                                len(urls), len(merged) - len(urls), len(merged))
+                    return merged
     except Exception as exc:
         logger.warning("Piped instance discovery failed: %s", exc)
 
@@ -511,14 +445,17 @@ async def _get_invidious_instances(client: "Any") -> list[str]:
         if resp.status_code == 200:
             data = resp.json()
             urls = []
-            for entry in data:
-                # Mỗi entry là [name, {...}] — lấy "uri", chỉ https, chỉ api hoạt động
-                info = entry[1] if isinstance(entry, list) and len(entry) > 1 else {}
-                uri = (info.get("uri") or "").rstrip("/")
-                # Không lọc theo "api" field nữa — field này thường không phản ánh đúng
-                # tình trạng thực tế, có thể loại bỏ nhầm instance vẫn hoạt động tốt.
-                if uri and uri.startswith("https://") and uri not in urls:
-                    urls.append(uri)
+            if isinstance(data, list):
+                for entry in data:
+                    # Mỗi entry là [name, {...}] — lấy "uri", chỉ https, chỉ api hoạt động
+                    info = entry[1] if isinstance(entry, list) and len(entry) > 1 else {}
+                    if not isinstance(info, dict):
+                        continue
+                    uri = (info.get("uri") or "").rstrip("/")
+                    # Không lọc theo "api" field nữa — field này thường không phản ánh đúng
+                    # tình trạng thực tế, có thể loại bỏ nhầm instance vẫn hoạt động tốt.
+                    if uri and uri.startswith("https://") and uri not in urls:
+                        urls.append(uri)
             if urls:
                 merged = urls + [u for u in _INVIDIOUS_FALLBACK_HARDCODED if u not in urls]
                 _invidious_instances_cache = merged
@@ -738,79 +675,56 @@ class Track:
                 logger.warning("Bước search sơ bộ lỗi (%s) — thử lại trực tiếp qua client rotation", _search_exc)
                 video_url = resolved  # để vòng client rotation tự xử lý (kể cả dạng ytsearch1:)
 
-        # Bước 2: Thử không proxy trước → bị chặn thì dùng proxy → AI suggest fix
+        # Bước 2: Thử không proxy trước → bị chặn thì dùng proxy
         last_err: Exception | None = None
-        ai_opts: dict[str, Any] | None = None
 
-        skip_ai = False  # bật lên nếu gặp bot-check — AI không fix được thiếu cookies
-        for attempt in range(5):
-            if attempt == 4 and (ai_opts is None or skip_ai):
-                break
+        for attempt in range(4):
+            # Bright Data/proxy datacenter thường bị Google tự động gắn cờ bot, và
+            # còn gây JITTER khi stream thật (âm thanh giật) — ưu tiên tối đa việc
+            # KHÔNG dùng proxy. Chỉ dùng proxy ở lần thử CUỐI CÙNG (attempt 3).
+            #
+            # THỨ TỰ CLIENT (đã đảo lại dựa trên thực tế quan sát được):
+            #   attempt 0: android/tv_embedded/android_vr, KHÔNG proxy — đây là
+            #     tổ hợp DUY NHẤT luôn thành công trong thực tế (chưa từng thử
+            #     không proxy trước đây, luôn ép proxy oan uổng). tv_embedded/
+            #     android_vr được YouTube thiết kế bypass-auth nên vẫn còn trả
+            #     URL stream trực tiếp, không bị khoá SABR-only như web/ios.
+            #   attempt 1: web + cookies + PO-Token, KHÔNG proxy — vẫn giữ thử
+            #     (đề phòng 1 số video legacy chưa bị SABR khoá), nhưng KHÔNG
+            #     còn ưu tiên vì thực tế gần như luôn "Requested format is not
+            #     available" — đây là do YouTube đã chuyển web/ios sang
+            #     SABR-only streaming (không lộ URL trực tiếp nữa), KHÔNG phải
+            #     lỗi cookie/PO-Token — không có cách nào fix từ phía yt-dlp.
+            #   attempt 2: ios, KHÔNG proxy — tương tự, giữ làm phương án phụ.
+            #   attempt 3: android/tv_embedded/android_vr, CÓ proxy — chỉ khi
+            #     cả 3 lần direct đều fail (hiếm, có thể do IP server bị chặn).
+            use_proxy = (attempt == 3)
 
-            if attempt == 4 and ai_opts and not skip_ai:
-                opts = _ytdl_opts(True, use_proxy=ai_opts.get("use_proxy", True))
-                # Chỉ nhận client trong whitelist đã biết — client lạ/sai tên có thể
-                # làm yt-dlp crash nội bộ (vd: KeyError('INNERTUBE_CONTEXT')).
-                _VALID_CLIENTS = {
-                    "ios", "android", "web", "tv", "tv_embedded", "android_vr",
-                    "web_embedded", "web_creator", "web_music", "mweb",
-                }
-                suggested = ai_opts.get("player_clients") or []
-                safe_clients = [c for c in suggested if c in _VALID_CLIENTS]
-                if safe_clients:
-                    opts["extractor_args"]["youtube"] = {"player_client": safe_clients}
-                elif suggested:
-                    logger.warning("AI suggested invalid client(s) %s, ignoring", suggested)
-                if ai_opts.get("format"):
-                    opts["format"] = ai_opts["format"]
-                logger.info("AI FIX | trying: %s", ai_opts.get("reason", ""))
-            else:
-                # Bright Data/proxy datacenter thường bị Google tự động gắn cờ bot, và
-                # còn gây JITTER khi stream thật (âm thanh giật) — ưu tiên tối đa việc
-                # KHÔNG dùng proxy. Chỉ dùng proxy ở lần thử CUỐI CÙNG (attempt 3).
-                #
-                # THỨ TỰ CLIENT (đã đảo lại dựa trên thực tế quan sát được):
-                #   attempt 0: android/tv_embedded/android_vr, KHÔNG proxy — đây là
-                #     tổ hợp DUY NHẤT luôn thành công trong thực tế (chưa từng thử
-                #     không proxy trước đây, luôn ép proxy oan uổng). tv_embedded/
-                #     android_vr được YouTube thiết kế bypass-auth nên vẫn còn trả
-                #     URL stream trực tiếp, không bị khoá SABR-only như web/ios.
-                #   attempt 1: web + cookies + PO-Token, KHÔNG proxy — vẫn giữ thử
-                #     (đề phòng 1 số video legacy chưa bị SABR khoá), nhưng KHÔNG
-                #     còn ưu tiên vì thực tế gần như luôn "Requested format is not
-                #     available" — đây là do YouTube đã chuyển web/ios sang
-                #     SABR-only streaming (không lộ URL trực tiếp nữa), KHÔNG phải
-                #     lỗi cookie/PO-Token — không có cách nào fix từ phía yt-dlp.
-                #   attempt 2: ios, KHÔNG proxy — tương tự, giữ làm phương án phụ.
-                #   attempt 3: android/tv_embedded/android_vr, CÓ proxy — chỉ khi
-                #     cả 3 lần direct đều fail (hiếm, có thể do IP server bị chặn).
-                use_proxy = (attempt == 3)
-
-                if attempt == 0:
-                    # KHÔNG dùng cookies — ios/android/tv_embedded/android_vr là client
-                    # kiểu app-token, KHÔNG dùng session cookie. Nếu truyền cookies=True,
-                    # yt-dlp sẽ tự SKIP hẳn các client này (mất hết format), không phải
-                    # chỉ đơn thuần "thử cookie cho chắc" — đã test và xác nhận tệ hơn.
-                    opts = _ytdl_opts(False, use_proxy=use_proxy)
-                    opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr"],
-                                                           "skip": ["translated_subs", "comments"]}
-                elif attempt == 1:
-                    # web + cookies + PO-Token — combo đúng nếu video chưa bị SABR khoá
-                    opts = _ytdl_opts(True, use_proxy=use_proxy)
-                    opts["extractor_args"]["youtube"] = {"player_client": ["web"],
-                                                           "skip": ["translated_subs", "comments"]}
-                elif attempt == 2:
-                    # ios KHÔNG dùng cookies — nếu không yt-dlp sẽ tự skip client này
-                    opts = _ytdl_opts(False, use_proxy=use_proxy)
-                    opts["extractor_args"]["youtube"] = {"player_client": ["ios"],
-                                                           "skip": ["translated_subs", "comments"]}
-                else:  # attempt 3 — phương án cuối, CÓ proxy
-                    opts = _ytdl_opts(False, use_proxy=use_proxy)
-                    opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr"],
-                                                           "skip": ["translated_subs", "comments"]}
-                logger.info("Client rotation | attempt %d → %s (proxy=%s)", attempt + 1,
-                            opts["extractor_args"]["youtube"]["player_client"],
-                            "yes" if use_proxy else "no")
+            if attempt == 0:
+                # KHÔNG dùng cookies — ios/android/tv_embedded/android_vr là client
+                # kiểu app-token, KHÔNG dùng session cookie. Nếu truyền cookies=True,
+                # yt-dlp sẽ tự SKIP hẳn các client này (mất hết format), không phải
+                # chỉ đơn thuần "thử cookie cho chắc" — đã test và xác nhận tệ hơn.
+                opts = _ytdl_opts(False, use_proxy=use_proxy)
+                opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr"],
+                                                       "skip": ["translated_subs", "comments"]}
+            elif attempt == 1:
+                # web + cookies + PO-Token — combo đúng nếu video chưa bị SABR khoá
+                opts = _ytdl_opts(True, use_proxy=use_proxy)
+                opts["extractor_args"]["youtube"] = {"player_client": ["web"],
+                                                       "skip": ["translated_subs", "comments"]}
+            elif attempt == 2:
+                # ios KHÔNG dùng cookies — nếu không yt-dlp sẽ tự skip client này
+                opts = _ytdl_opts(False, use_proxy=use_proxy)
+                opts["extractor_args"]["youtube"] = {"player_client": ["ios"],
+                                                       "skip": ["translated_subs", "comments"]}
+            else:  # attempt 3 — phương án cuối, CÓ proxy
+                opts = _ytdl_opts(False, use_proxy=use_proxy)
+                opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr"],
+                                                       "skip": ["translated_subs", "comments"]}
+            logger.info("Client rotation | attempt %d → %s (proxy=%s)", attempt + 1,
+                        opts["extractor_args"]["youtube"]["player_client"],
+                        "yes" if use_proxy else "no")
 
             try:
                 data: dict[str, Any] = await loop.run_in_executor(None, _extract_sync, opts, video_url)
@@ -838,11 +752,7 @@ class Track:
                     "407", "Proxy Authentication"
                 ])
 
-                # Bot-check mà không có cookies hợp lệ → AI không cứu được, khỏi tốn thời gian chờ
-                if is_bot_check and not _cookies_valid():
-                    skip_ai = True
-
-                if is_rate_limit and attempt < 4:
+                if is_rate_limit and attempt < 3:
                     current = opts.get("proxy", "")
                     # 407 = proxy auth fail → mark dead permanent
                     if "407" in err_str or "Proxy Authentication" in err_str:
@@ -864,16 +774,6 @@ class Track:
                         attempt + 1, delay, current[-15:] if current else "none",
                     )
                     await asyncio.sleep(delay)
-
-                    # Sau lần thử cuối (attempt 3 = android/tv/vr + proxy) → nhờ AI
-                    # suggest fix (bỏ qua nếu đã biết là thiếu cookies)
-                    if attempt == 3 and ai_opts is None and not skip_ai:
-                        ai_opts = await _ai_suggest_fix(
-                            error   = err_str[:300],
-                            context = f"video_url={video_url}, proxy={'yes' if current else 'no'}",
-                        )
-                        if ai_opts:
-                            logger.info("AI suggested: %s", ai_opts.get("reason", ""))
                     continue
                 # Hết attempt cuối cùng mà vẫn fail → KHÔNG raise ngay ở đây,
                 # để code phía dưới có cơ hội thử Piped fallback trước khi bỏ cuộc.
