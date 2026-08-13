@@ -103,28 +103,6 @@ def _run_flask() -> None:
     _flask_app.run(host="0.0.0.0", port=_PORT, use_reloader=False)
 
 
-def _log_outbound_ip() -> None:
-    """
-    Log IP outbound thật của server — cần cái này để thêm vào IP Allowlist của
-    Bright Data (proxy residential yêu cầu whitelist IP trước khi cho kết nối).
-    Chạy 1 lần lúc khởi động, không lặp lại.
-    """
-    import urllib.request
-    log = logging.getLogger("bgutil")
-    try:
-        with urllib.request.urlopen("https://api.ipify.org", timeout=10) as resp:
-            ip = resp.read().decode().strip()
-        log.info(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "  🌐 IP OUTBOUND CỦA SERVER NÀY: %s\n"
-            "  → Copy IP này vào Bright Data → IP Allowlist → Add allowed IP\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            ip,
-        )
-    except Exception as exc:
-        log.warning("Không lấy được IP outbound: %s", exc)
-
-
 def keep_alive() -> None:
     """Start the Flask keep-alive server on a background daemon thread."""
     Thread(target=_run_flask, daemon=True).start()
@@ -321,6 +299,8 @@ EXTENSIONS: list[str] = ["cogs.music"]
 EXPECTED_COMMANDS: frozenset[str] = frozenset({
     "play", "pause", "resume", "skip",
     "stop", "queue", "nowplaying", "volume",
+    "spotify", "seek", "history", "247",
+    "bassboost", "nightcore",
 })
 
 
@@ -374,23 +354,6 @@ class MusicBot(commands.Bot):
             )
 
         await self._sync_guild_only(config.DEV_GUILD_ID)
-
-        # ── Cookie sync ─────────────────────────────────────────────────────────
-        # Cập nhật cookie lần đầu khi bot khởi động
-        try:
-            from utils.cookie_sync import update_cookie_from_service, scheduled_cookie_update
-
-            if update_cookie_from_service():
-                logger.info("✅ Cookie đã được cập nhật thành công")
-            else:
-                logger.warning("⚠️ Không thể cập nhật cookie, bot sẽ dùng cookie cũ (nếu có)")
-
-            # Lên lịch cập nhật cookie định kỳ (mỗi 2 giờ)
-            asyncio.create_task(scheduled_cookie_update(2))
-        except ImportError:
-            logger.warning("⚠️ Không tìm thấy utils.cookie_sync — bỏ qua cookie sync")
-        except Exception as e:
-            logger.error(f"❌ Lỗi cookie sync: {e}")
 
     async def _sync_guild_only(self, guild_id: int) -> None:
         guild_obj = discord.Object(id=guild_id)
@@ -499,5 +462,4 @@ async def main() -> None:
 if __name__ == "__main__":
     keep_alive()
     start_bgutil_provider()
-    Thread(target=_log_outbound_ip, daemon=True).start()
     asyncio.run(main())
