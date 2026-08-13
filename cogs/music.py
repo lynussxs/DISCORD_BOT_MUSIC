@@ -1003,11 +1003,15 @@ def _e_queued(track: Track, pos: int) -> discord.Embed:
 
 # ── DJ role permission ──────────────────────────────────────────────────────
 #
-# Mặc định KHÔNG giới hạn gì (giữ nguyên trải nghiệm cũ, mọi người đều bấm
-# được). Chỉ khi admin chạy /djrole set @role thì các nút/slash-command có
-# khả năng "phá" nhạc (pause, resume, skip, stop, volume, seek, loop,
-# shuffle, autoplay, back, bassboost, nightcore, 24/7) mới bị khoá lại —
-# chỉ role đó (+ Admin/Manage Server/chủ server) mới dùng được.
+# Mặc định (KHÔNG cần cấu hình gì): người đã /play bài ĐANG PHÁT là người duy
+# nhất (ngoài Admin/chủ server) được điều khiển panel/slash-command của bài
+# đó — pause, resume, skip, stop, volume, seek, loop, shuffle, autoplay,
+# back, bassboost, nightcore, 24/7. Người khác vẫn THẤY panel bình thường,
+# chỉ là bấm nút không có tác dụng (báo "không đủ quyền").
+#
+# /djrole cho phép admin đặt THÊM 1 role được điều khiển MỌI bài (không chỉ
+# bài họ tự request) — dùng khi muốn có vài người "quản lý nhạc" cố định
+# thay vì giới hạn tuyệt đối theo người request.
 
 _DJ_ROLES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "dj_roles.json")
 
@@ -1033,39 +1037,59 @@ def _save_dj_roles() -> None:
 _DJ_ROLES: dict[int, int] = _load_dj_roles()
 
 
-def _is_dj(member: discord.Member) -> bool:
-    """True nếu member được phép điều khiển nhạc (skip/stop/volume/...)."""
+def _can_control(member: discord.Member, player: "GuildPlayer | None") -> bool:
+    """
+    True nếu member được phép điều khiển nhạc ngay bây giờ. Thứ tự ưu tiên:
+      1. Chủ server / Admin / Manage Server — luôn được (tránh tự khoá tay).
+      2. Có DJ role (nếu admin đã /djrole set) — điều khiển được MỌI bài.
+      3. Là người đã /play ra bài ĐANG PHÁT hiện tại — chỉ điều khiển được
+         bài của chính mình, người khác thì không.
+    Nếu cả 3 đều không thoả → False (vẫn xem panel được, chỉ không bấm được).
+    """
     guild = member.guild
-    dj_role_id = _DJ_ROLES.get(guild.id)
-    if dj_role_id is None:
-        return True  # chưa cấu hình DJ role → mở cho tất cả (mặc định cũ)
     if member.id == guild.owner_id:
         return True
     perms = member.guild_permissions
     if perms.administrator or perms.manage_guild:
         return True
-    return any(r.id == dj_role_id for r in member.roles)
 
-
-def _e_dj_denied(guild: discord.Guild) -> discord.Embed:
     dj_role_id = _DJ_ROLES.get(guild.id)
-    role_txt = f"<@&{dj_role_id}>" if dj_role_id else "DJ"
+    if dj_role_id is not None and any(r.id == dj_role_id for r in member.roles):
+        return True
+
+    if player is not None and player.current is not None:
+        requester = getattr(player.current, "requester", None)
+        if requester is not None and requester.id == member.id:
+            return True
+
+    return False
+
+
+def _e_dj_denied(guild: discord.Guild, player: "GuildPlayer | None" = None) -> discord.Embed:
+    dj_role_id  = _DJ_ROLES.get(guild.id)
+    requester   = getattr(player.current, "requester", None) if (player and player.current) else None
+    bits: list[str] = []
+    if requester:
+        bits.append(f"người đã `/play` bài này ({requester.mention})")
+    if dj_role_id:
+        bits.append(f"<@&{dj_role_id}>")
+    bits.append("Admin/chủ server")
     return discord.Embed(
         title       = "🚫 Không đủ quyền",
-        description = f"Chỉ {role_txt} (hoặc Admin/chủ server) mới được điều khiển nhạc.",
+        description = f"Chỉ {', '.join(bits)} mới được điều khiển bài này.",
         colour      = COLOUR_STOP,
     )
 
 
-async def _require_dj(interaction: discord.Interaction) -> bool:
+async def _require_dj(interaction: discord.Interaction, player: "GuildPlayer | None" = None) -> bool:
     """Dùng đầu mỗi slash command bị giới hạn. True = được phép; False = đã tự
     gửi phản hồi từ chối, caller chỉ cần `return`."""
     member = interaction.user
     if not isinstance(member, discord.Member) or interaction.guild is None:
         return True
-    if _is_dj(member):
+    if _can_control(member, player):
         return True
-    embed = _e_dj_denied(interaction.guild)
+    embed = _e_dj_denied(interaction.guild, player)
     try:
         if not interaction.response.is_done():
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1117,10 +1141,12 @@ class MusicControlView(discord.ui.View):
         member = interaction.user
         if not isinstance(member, discord.Member) or interaction.guild is None:
             return True
-        if _is_dj(member):
+        if _can_control(member, self.player):
             return True
         try:
-            await interaction.response.send_message(embed=_e_dj_denied(interaction.guild), ephemeral=True)
+            await interaction.response.send_message(
+                embed=_e_dj_denied(interaction.guild, self.player), ephemeral=True
+            )
         except discord.HTTPException:
             pass
         return False
@@ -2094,8 +2120,8 @@ class Music(commands.Cog):
     @app_commands.command(name="pause", description="Pause the current song.")
     @app_commands.guild_only()
     async def pause(self, interaction: discord.Interaction) -> None:
-        if not await _require_dj(interaction): return
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not await _require_dj(interaction, p): return
         if not p or not p.current:
             await interaction.response.send_message(
                 embed=_e_err("Nothing Playing", "There's nothing to pause."),
@@ -2123,8 +2149,8 @@ class Music(commands.Cog):
     @app_commands.command(name="resume", description="Resume the paused song.")
     @app_commands.guild_only()
     async def resume(self, interaction: discord.Interaction) -> None:
-        if not await _require_dj(interaction): return
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not await _require_dj(interaction, p): return
         if not p or not p.current:
             await interaction.response.send_message(
                 embed=_e_err("Nothing Paused", "There's nothing to resume."),
@@ -2152,8 +2178,8 @@ class Music(commands.Cog):
     @app_commands.command(name="skip", description="Skip the current song.")
     @app_commands.guild_only()
     async def skip(self, interaction: discord.Interaction) -> None:
-        if not await _require_dj(interaction): return
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not await _require_dj(interaction, p): return
         if not p or not p.current:
             await interaction.response.send_message(
                 embed=_e_err("Nothing Playing", "There's nothing to skip."),
@@ -2185,7 +2211,6 @@ class Music(commands.Cog):
     @app_commands.command(name="stop", description="Stop playback, clear the queue, and disconnect.")
     @app_commands.guild_only()
     async def stop(self, interaction: discord.Interaction) -> None:
-        if not await _require_dj(interaction): return
         gid = interaction.guild_id
         assert gid is not None
         guild = interaction.guild
@@ -2194,6 +2219,8 @@ class Music(commands.Cog):
         vc = guild.voice_client
         # Lấy player HOẶC tìm bot đang trong voice
         p = self._get_player(gid)
+
+        if not await _require_dj(interaction, p): return
 
         # Nếu không có player nhưng bot vẫn trong voice → disconnect luôn
         if not p:
@@ -2308,8 +2335,8 @@ class Music(commands.Cog):
         interaction: discord.Interaction,
         level: app_commands.Range[int, 0, 100],
     ) -> None:
-        if not await _require_dj(interaction): return
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not await _require_dj(interaction, p): return
         if not p:
             await interaction.response.send_message(
                 embed=_e_err("Not Connected", "I'm not in a voice channel."),
@@ -2588,8 +2615,8 @@ class Music(commands.Cog):
     @app_commands.describe(position="Thời gian (vd: 1:30 hoặc 90)")
     @app_commands.guild_only()
     async def seek(self, interaction: discord.Interaction, position: str) -> None:
-        if not await _require_dj(interaction): return
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not await _require_dj(interaction, p): return
         if not p or not p.current:
             await interaction.response.send_message(
                 embed=_e_err("Nothing Playing", "Không có bài nào đang phát."), ephemeral=True
@@ -2664,8 +2691,8 @@ class Music(commands.Cog):
     @app_commands.command(name="247", description="Bật/tắt chế độ 24/7 — bot không tự rời.")
     @app_commands.guild_only()
     async def mode_247(self, interaction: discord.Interaction) -> None:
-        if not await _require_dj(interaction): return
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not await _require_dj(interaction, p): return
         if not p:
             await interaction.response.send_message(
                 embed=_e_err("Not Connected", "Bot chưa trong voice channel."), ephemeral=True
@@ -2691,8 +2718,8 @@ class Music(commands.Cog):
     @app_commands.command(name="bassboost", description="Bật/tắt Bassboost (áp dụng từ bài tiếp).")
     @app_commands.guild_only()
     async def bassboost(self, interaction: discord.Interaction) -> None:
-        if not await _require_dj(interaction): return
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not await _require_dj(interaction, p): return
         if not p:
             await interaction.response.send_message(
                 embed=_e_err("Not Connected", "Bot chưa trong voice channel."), ephemeral=True
@@ -2716,8 +2743,8 @@ class Music(commands.Cog):
     @app_commands.command(name="nightcore", description="Bật/tắt Nightcore (speed up + pitch).")
     @app_commands.guild_only()
     async def nightcore(self, interaction: discord.Interaction) -> None:
-        if not await _require_dj(interaction): return
         p = self._get_player(interaction.guild_id)  # type: ignore[arg-type]
+        if not await _require_dj(interaction, p): return
         if not p:
             await interaction.response.send_message(
                 embed=_e_err("Not Connected", "Bot chưa trong voice channel."), ephemeral=True
@@ -2740,11 +2767,11 @@ class Music(commands.Cog):
 
     @app_commands.command(
         name="djrole",
-        description="Đặt/xem/xoá role được phép điều khiển nhạc (skip, stop, volume, panel...).",
+        description="Đặt/xem/xoá 1 role được điều khiển MỌI bài (ngoài người tự /play bài đó).",
     )
     @app_commands.describe(
-        role  = "Role được phép điều khiển nhạc. Để trống = xem cấu hình hiện tại.",
-        clear = "True để bỏ giới hạn — mọi người đều điều khiển được như trước.",
+        role  = "Role được điều khiển mọi bài hát. Để trống = xem cấu hình hiện tại.",
+        clear = "True để bỏ role này (vẫn còn quy tắc mặc định: ai /play bài nào tự điều khiển bài đó).",
     )
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
@@ -2773,9 +2800,12 @@ class Music(commands.Cog):
             _save_dj_roles()
             await interaction.response.send_message(
                 embed=discord.Embed(
-                    title       = "🔓 Đã bỏ giới hạn DJ role",
-                    description = "Mọi người đều điều khiển được nhạc như trước." if had
-                                  else "Server này chưa từng đặt DJ role.",
+                    title       = "🔓 Đã bỏ DJ role",
+                    description = (
+                        "Không còn role nào điều khiển MỌI bài nữa.\n"
+                        "Quy tắc mặc định vẫn giữ nguyên: **ai `/play` bài nào thì tự điều khiển bài đó** "
+                        "(+ Admin/chủ server luôn được)."
+                    ) if had else "Server này chưa từng đặt DJ role.",
                     colour      = COLOUR_SUCCESS,
                 ),
                 ephemeral=True,
@@ -2784,10 +2814,15 @@ class Music(commands.Cog):
 
         if role is None:
             current_id = _DJ_ROLES.get(guild.id)
-            desc = f"Đang giới hạn cho <@&{current_id}> (+ Admin/chủ server)." if current_id \
-                else "Chưa cấu hình — mọi người đều điều khiển được nhạc (mặc định)."
+            base = (
+                "**Mặc định (luôn áp dụng):** ai `/play` ra bài đang phát thì chỉ người đó "
+                "(+ Admin/chủ server) điều khiển được panel/lệnh của bài đó — người khác thấy "
+                "panel nhưng bấm không có tác dụng."
+            )
+            extra = f"\n\n**DJ role hiện tại:** <@&{current_id}> — role này điều khiển được **mọi bài**, không riêng gì bài tự request." \
+                if current_id else "\n\n**DJ role:** chưa đặt."
             await interaction.response.send_message(
-                embed=discord.Embed(title="🎚️ DJ Role hiện tại", description=desc, colour=COLOUR_QUEUE),
+                embed=discord.Embed(title="🎚️ Cấu hình điều khiển nhạc", description=base + extra, colour=COLOUR_QUEUE),
                 ephemeral=True,
             )
             return
@@ -2798,10 +2833,10 @@ class Music(commands.Cog):
             embed=discord.Embed(
                 title       = "🎚️ Đã đặt DJ Role",
                 description = (
-                    f"Từ giờ chỉ {role.mention} (+ Admin/chủ server) mới được dùng "
-                    "`/pause /resume /skip /stop /volume /seek /247 /bassboost /nightcore` "
-                    "và các nút điều khiển trong panel.\n"
-                    "-# Dùng `/djrole clear:True` để bỏ giới hạn."
+                    f"{role.mention} giờ điều khiển được **mọi bài hát** (không riêng bài họ tự request), "
+                    "cộng thêm quy tắc mặc định là ai `/play` bài nào vẫn tự điều khiển được bài đó, "
+                    "và Admin/chủ server luôn được.\n"
+                    "-# Dùng `/djrole clear:True` để bỏ role này (giữ lại quy tắc mặc định)."
                 ),
                 colour      = COLOUR_SUCCESS,
             ),
