@@ -300,7 +300,7 @@ EXPECTED_COMMANDS: frozenset[str] = frozenset({
     "play", "pause", "resume", "skip",
     "stop", "queue", "nowplaying", "volume",
     "spotify", "seek", "history", "247",
-    "bassboost", "nightcore",
+    "bassboost", "nightcore", "djrole",
 })
 
 
