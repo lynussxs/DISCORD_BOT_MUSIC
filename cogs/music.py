@@ -882,33 +882,30 @@ class Track:
         if last_exc:
             logger.warning("Failed to refresh URL for '%s': %s", self.title, last_exc)
 
-    async def make_source(self, volume: float, seek: float = 0) -> discord.FFmpegOpusAudio:
+    async def make_source(self, volume: float, seek: float = 0) -> discord.PCMVolumeTransformer:
         """
         Tạo audio source để phát.
 
-        THIẾT KẾ ĐƠN GIẢN (sau nhiều lần thử phức tạp hoá không hiệu quả):
-        stream trực tiếp qua ffmpeg ngay lập tức, KHÔNG predownload,
-        KHÔNG chuỗi fallback proxy/Piped dài dòng ở đây nữa.
+        Dùng FFmpegPCMAudio + PCMVolumeTransformer thay vì FFmpegOpusAudio —
+        cho phép chỉnh volume LIVE khi đang phát (không cần restart ffmpeg).
+        FFmpegOpusAudio bake volume vào ffmpeg filter lúc tạo source nên nút
+        Up/Down chỉ áp dụng cho bài TIẾP THEO, bài đang phát không đổi gì —
+        đây là bug đã gặp thực tế, PCMVolumeTransformer sửa triệt để.
 
-        Lý do: predownload + đổi proxy + thử Piped (từng thêm vào) khiến mỗi
-        lần phát tốn thêm 10-100+ giây chờ mà KHÔNG đảm bảo hết giật (vì gốc
-        rễ là proxy datacenter chậm/không ổn định — chờ thêm không giải quyết
-        được). Stream trực tiếp cho kết quả NGHE NGAY, và nếu giữa chừng bị
-        đứt (EOF/403/proxy chậm), player loop đã có cơ chế tự refresh URL và
-        resume đúng vị trí (xem STREAM DROP trong _player_loop) — đó là nơi
-        xử lý sự cố hợp lý hơn nhiều so với đoán trước rồi tải cả bài về.
+        Đánh đổi: pipe ffmpeg→discord.py giờ truyền PCM thô (~1.4Mbps) thay
+        vì Opus đã nén (~128kbps), CPU tăng nhẹ do discord.py tự encode Opus
+        (qua libopus/PyNaCl, không phải Python thuần) — không đáng kể cho 1
+        stream duy nhất.
         """
-        safe_vol = max(0.01, min(2.0, volume))
-        filters = [f"volume={safe_vol:.3f}"]
+        filters = []
         if getattr(self, '_bassboost', False):
             filters.append("bass=g=10:f=110:w=0.3")
         if getattr(self, '_nightcore', False):
             filters.append("asetrate=44100*1.25,aresample=44100")
-        filter_str = ",".join(filters)
+        filter_str = ",".join(filters) if filters else "anull"
+        opts = f'-vn -filter:a "{filter_str}"'
 
-        # Host ổn định (Railway) — dùng bitrate đầy đủ 128k, không cần hy
-        # sinh chất lượng để đối phó mạng chập chờn như trước (Heavencloud).
-        opts = f'-vn -filter:a "{filter_str}" -b:a 128k -application audio'
+        safe_vol = max(0.01, min(2.0, volume))
 
         # Nếu phải qua proxy VÀ có video_id: thử Piped NHANH (cap cứng 5s)
         # trước khi stream qua proxy — server Piped tự fetch từ YouTube phía
@@ -923,18 +920,20 @@ class Track:
                 piped_data = None
             if piped_data and piped_data.get("url"):
                 logger.info("Dùng Piped stream cho '%s' — tránh proxy jitter", self.title)
-                return discord.FFmpegOpusAudio(
+                pcm = discord.FFmpegPCMAudio(
                     piped_data["url"],
                     before_options=_ffmpeg_before(no_proxy=True),
-                    options=f'-vn -filter:a "{filter_str}" -b:a 128k -application audio',
+                    options=opts,
                 )
+                return discord.PCMVolumeTransformer(pcm, volume=safe_vol)
 
-        return discord.FFmpegOpusAudio(
+        pcm = discord.FFmpegPCMAudio(
             self.url,
             before_options=_ffmpeg_before(seek=seek, no_proxy=not self._url_via_proxy,
                                            proxy_override=self._proxy_used),
             options=opts,
         )
+        return discord.PCMVolumeTransformer(pcm, volume=safe_vol)
 
 
 # ── Embed helpers ──────────────────────────────────────────────────────────────
@@ -1275,6 +1274,7 @@ class GuildPlayer:
         self._queue: list[Track]   = []
         self.current: Track | None = None
         self.volume: float         = volume
+        self._current_source: discord.PCMVolumeTransformer | None = None  # cho volume live
         # Đếm số lệnh /play đang resolve (yt-dlp) nhưng CHƯA kịp vào queue.
         # Idle-timeout phải chờ những resolve này xong, không được đếm giờ
         # trong lúc đó — nếu không sẽ auto-disconnect giữa chừng khi bài đang
@@ -1341,14 +1341,12 @@ class GuildPlayer:
 
     def set_volume(self, pct: int) -> None:
         """
-        Set the target volume for the next track (0–100 → 0.01–2.0 internally).
-
-        The current track's audio is not affected because its volume is already
-        baked into the FFmpeg filter at source-creation time.  The updated
-        self.volume is reflected in the UI immediately and applied when the
-        next source is created.
+        Set volume — áp dụng LIVE cho bài đang phát (PCMVolumeTransformer),
+        không cần đợi bài tiếp theo mới có tác dụng như trước.
         """
         self.volume = max(0.01, min(2.0, pct / 100))
+        if self._current_source is not None:
+            self._current_source.volume = self.volume
 
     async def stop(self) -> None:
         """
@@ -1441,6 +1439,7 @@ class GuildPlayer:
                 # ── Create audio source ────────────────────────────────────────
                 try:
                     source = await track.make_source(self.volume)
+                    self._current_source = source  # cho set_volume() chỉnh live
                 except Exception as exc:
                     logger.error(
                         "SOURCE | failed for '%s': %s [guild %d]",
@@ -1450,7 +1449,8 @@ class GuildPlayer:
                         embed=_e_err(
                             "Playback Error",
                             f"Could not load **{track.title}**.\n`{exc}`\nSkipping…",
-                        )
+                        ),
+                        delete_after=15,
                     )
                     self.current = None
                     self._start  = None
@@ -1495,7 +1495,8 @@ class GuildPlayer:
                                 "⚠️ Mất kết nối voice",
                                 f"Bot bị ngắt khỏi voice trước khi phát được **{track.title}**.\n"
                                 "Dùng `/play` lại để bot vào lại voice nhé!",
-                            )
+                            ),
+                            delete_after=15,
                         )
                     except discord.HTTPException:
                         pass
@@ -1591,6 +1592,7 @@ class GuildPlayer:
                                 precise_elapsed = (time.monotonic() - self._start) if self._start else 0.0
                                 seek_pos = max(0.0, precise_elapsed - 0.3)
                                 new_src = await track.make_source(self.volume, seek=seek_pos)
+                                self._current_source = new_src
                                 self._next.clear()
                                 self.vc.play(new_src, after=_after)
                                 # QUAN TRỌNG: reset lại self._start theo đúng vị trí
@@ -1618,7 +1620,8 @@ class GuildPlayer:
                             embed=_e_err(
                                 "⚠️ Không thể phát",
                                 f"**{track.title}** bị YouTube chặn (403) sau {_403_retries[0]} lần thử.\nThử bài khác nhé!",
-                            )
+                            ),
+                            delete_after=15,
                         )
                     except discord.HTTPException:
                         pass
@@ -2505,15 +2508,17 @@ class Music(commands.Cog):
         track = p.current
         safe_vol = max(0.01, min(2.0, p.volume))
         try:
-            source = discord.FFmpegOpusAudio(
+            pcm = discord.FFmpegPCMAudio(
                 track.url,
                 before_options=_ffmpeg_before(seek=secs, no_proxy=not getattr(track, "_url_via_proxy", False),
                                                proxy_override=getattr(track, "_proxy_used", None)),
-                options=f"-vn -filter:a volume={safe_vol:.3f} -b:a 64k",
+                options="-vn",
             )
+            source = discord.PCMVolumeTransformer(pcm, volume=safe_vol)
             p.vc.stop()
             await asyncio.sleep(0.3)
             p._start = time.monotonic() - secs
+            p._current_source = source
             p.vc.play(source, after=lambda e: p._loop.call_soon_threadsafe(p._next.set))
             await interaction.followup.send(
                 embed=discord.Embed(
