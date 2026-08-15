@@ -824,11 +824,22 @@ class Track:
                 )
             raise last_err  # type: ignore
 
-        # ── Nếu URL có gcr=us → re-fetch qua proxy US để tránh 403 khi stream ──
+        # ── Nếu URL có gcr=<country> → re-fetch qua proxy để tránh 403 khi stream ──
+        # TRƯỚC ĐÂY chỉ check "gcr=us" — video geo-lock nước khác (vd gcr=nl,
+        # gcr=de...) bị bỏ qua hoàn toàn, phát thẳng URL geo-mismatch → 403
+        # ngay khi ffmpeg mở stream. Giờ bắt MỌI mã quốc gia.
         stream_url = data.get("url", "")
-        if "gcr=us" in stream_url and WebshareProxyManager.PROXY_US:
-            logger.info("gcr=us detected, re-fetching via US proxy for '%s'", data.get("title", "?"))
-            _proxy.force_us()
+        gcr_match = re.search(r"gcr=([a-z]{2})\b", stream_url)
+        if gcr_match:
+            gcr_country = gcr_match.group(1).upper()
+            use_forced_us = gcr_country == "US" and bool(WebshareProxyManager.PROXY_US)
+            logger.info(
+                "gcr=%s detected, re-fetching via %s proxy for '%s'",
+                gcr_country, "US (forced)" if use_forced_us else "rotating pool",
+                data.get("title", "?"),
+            )
+            if use_forced_us:
+                _proxy.force_us()
             try:
                 # QUAN TRỌNG: phải chỉ định LẠI đúng player_client đã thành công
                 # (android/tv_embedded/android_vr) — nếu không, _ytdl_opts() sẽ
@@ -844,9 +855,9 @@ class Track:
                 data = await loop.run_in_executor(None, _extract_sync, proxy_opts, video_url)
                 resolved_via_proxy = True
                 resolved_proxy_str = proxy_opts.get("proxy")
-                logger.info("gcr=us re-fetch OK via proxy for '%s'", data.get("title", "?"))
+                logger.info("gcr=%s re-fetch OK via proxy for '%s'", gcr_country, data.get("title", "?"))
             except Exception as _e:
-                logger.warning("gcr=us proxy re-fetch failed: %s — will retry on stream drop", _e)
+                logger.warning("gcr=%s proxy re-fetch failed: %s — will retry on stream drop", gcr_country, _e)
 
         return cls(data, requester, via_proxy=resolved_via_proxy,  # type: ignore[possibly-undefined]
                    proxy_used=resolved_proxy_str)  # type: ignore[possibly-undefined]
