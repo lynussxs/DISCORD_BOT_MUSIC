@@ -87,15 +87,32 @@ class WebshareProxyManager:
         f"http://{_BRD_CUSTOMER}:{_BRD_CRED}@brd.superproxy.io:33335",
     ]
 
-    # Webshare auth proxies (ưu tiên cao — có credentials)
-    # Public free proxies (fallback — không auth, dễ chết nhưng nhiều)
+    # Webshare auth proxies — 10 proxy cố định của gói free, đã TEST THẬT bằng
+    # curl + ip-api.com ngày 16/08/2026, xác nhận còn sống + đúng quốc gia ghi
+    # chú (không phải đoán mò như phần free public bên dưới).
+    _WS_CRED = "fywznozi:gv94cmc9t7qs"
+    WEBSHARE_10 = [
+        f"http://{_WS_CRED}@31.56.127.193:7684",    # US — Seattle, WA
+        f"http://{_WS_CRED}@198.23.243.226:6361",   # US — Los Angeles, CA
+        f"http://{_WS_CRED}@38.154.185.97:6370",    # US — Piscataway, NJ
+        f"http://{_WS_CRED}@191.96.254.138:6185",   # US — Los Angeles, CA
+        f"http://{_WS_CRED}@142.111.67.146:5611",   # JP — Ueda, Nagano
+        f"http://{_WS_CRED}@31.59.20.176:6754",     # GB — London
+        f"http://{_WS_CRED}@45.38.107.97:6014",     # GB — London
+        f"http://{_WS_CRED}@198.105.121.200:6462",  # GB — Canary Wharf
+        f"http://{_WS_CRED}@64.137.96.74:6641",     # ES — Madrid
+        f"http://{_WS_CRED}@84.247.60.125:6095",    # PL — Warsaw
+    ]
+
+    # Public free proxies (fallback cuối — không auth, dễ chết, CHƯA kiểm
+    # chứng như WEBSHARE_10 ở trên, chỉ dùng khi mọi proxy có auth đều fail)
     PRIORITY = [
         # BRIGHTDATA_RESIDENTIAL rút khỏi vòng xoay LẦN 2 — đã test lại, vẫn 403
         # dù Playground báo OK + IP đã whitelist. Xác nhận lỗi hạ tầng phía họ.
         # Cần liên hệ support Bright Data xác nhận zone đã fix trước khi bật lại.
         # *BRIGHTDATA_RESIDENTIAL,
         *([ PROXY_US ] if PROXY_US else []),
-        "http://fywznozi:gv94cmc9t7qs@142.111.67.146:5611",  # Webshare Japan
+        *WEBSHARE_10,
         # Germany proxy đã bỏ — 31.58.9.4:6077 luôn 407 (credentials chết), gây lãng phí 1 attempt mỗi lần
         # ── Free public proxies (sort by latency) ──────────────────────────
         "http://34.43.46.91:80",           # US 325ms
@@ -134,7 +151,8 @@ class WebshareProxyManager:
         "http://43.167.16.253:3128",       # JP 1995ms
     ]
 
-    ALLOWED_COUNTRIES = {"US", "JP", "DE", "SG", "HK", "KR", "TW", "NL", "FR"}
+    ALLOWED_COUNTRIES = {"US", "JP", "DE", "SG", "HK", "KR", "TW", "NL", "FR", "GB", "ES", "PL"}
+
 
     def __init__(self) -> None:
         self.api_key     = os.environ.get("WEBSHARE_API_KEY", "")
@@ -1722,20 +1740,41 @@ class GuildPlayer:
                     if not self.vc.is_playing() and not self.vc.is_paused():
                         is_403 = _403_flag[0]
                         is_eof = _403_flag[2]
-                        if track.duration > 0 and elapsed < track.duration - 5 and (is_403 or is_eof):
+                        # QUAN TRỌNG: discord.py chỉ gọi after(err) với err KHÔNG
+                        # None nếu chính discord.py raise exception khi ĐỌC dữ liệu
+                        # từ ffmpeg. Khi ffmpeg fail NGAY LÚC MỞ URL (403, DNS lỗi,
+                        # v.v.) và thoát với các return code khác — ffmpeg đơn giản
+                        # không sinh ra byte nào, discord.py đọc được b'' (EOF) và
+                        # coi đó là "hết bài bình thường", gọi after(None). Nghĩa
+                        # là _403_flag KHÔNG BAO GIỜ được set cho đúng trường hợp
+                        # gây lỗi thật (như log 403 Forbidden ngay khi PLAY), khiến
+                        # bot "chết lặng" — không retry, không báo lỗi, chỉ ngồi
+                        # yên tới lúc auto-disconnect. Bù lại bằng heuristic: nếu
+                        # phát "xong" sớm bất thường so với duration thật (dưới 5s
+                        # hoặc <5% độ dài bài) → gần như chắc chắn là lỗi mở stream
+                        # câm lặng, không phải hết bài thật — coi như cần retry y
+                        # hệt nhánh 403.
+                        ended_too_early = (
+                            track.duration > 10
+                            and not is_403 and not is_eof
+                            and elapsed < min(5, track.duration * 0.05)
+                        )
+                        should_retry = is_403 or is_eof or ended_too_early
+                        if track.duration > 0 and elapsed < track.duration - 5 and should_retry:
                             retries   = _403_retries[0]
                             max_retry = _MAX_EOF_RETRY if is_eof else _MAX_403_RETRY
                             if retries >= max_retry:
                                 logger.warning("Stream retry limit (%d) for '%s', skipping.", retries, track.title)
                                 break
-                            reason = "EOF/URL-expire" if is_eof else "403"
+                            reason = "EOF/URL-expire" if is_eof else ("403" if is_403 else "im lặng (ffmpeg fail sớm, không báo lỗi)")
                             logger.warning(
                                 "STREAM DROP %s (attempt %d/%d) at %ds/%ds for '%s', refreshing…",
                                 reason, retries + 1, max_retry, elapsed, track.duration, track.title,
                             )
                             try:
                                 is_geo = "gcr=" in track.url
-                                if is_geo:
+                                is_geo_us = "gcr=us" in track.url
+                                if is_geo_us:
                                     _proxy.force_us()
                                 await track.refresh_url(self._loop, force=True, force_proxy=is_geo)
                                 _403_flag[0] = False
