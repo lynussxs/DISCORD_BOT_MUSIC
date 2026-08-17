@@ -265,8 +265,10 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     # tv_embedded/android_vr được thiết kế để BYPASS auth — nếu gửi kèm cookies,
     # YouTube trả về format list rỗng/hạn chế → "Requested format is not available".
     # Khi có cookies hợp lệ → ưu tiên client hỗ trợ auth (web, android).
+    # Thêm "tv" — hiện là 1 trong các client MẶC ĐỊNH của chính yt-dlp (cùng
+    # ios/web) từ giữa 2025, khá bền với PO-Token so với mweb/web đơn thuần.
     cookie_file_exists = cookies and _cookies_valid()
-    player_clients = ["web", "android", "ios"] if cookie_file_exists else ["tv_embedded", "android_vr", "ios"]
+    player_clients = ["tv", "web", "android", "ios"] if cookie_file_exists else ["tv", "tv_embedded", "android_vr", "ios"]
 
     opts: dict[str, Any] = {
         "format"          : "bestaudio/best/18",  # 18 = progressive mp4 fallback, gần như luôn có
@@ -293,10 +295,15 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
         "extractor_retries"  : 1,  # code đã tự retry qua client rotation ở tầng ngoài,
                                     # để 3 ở đây sẽ nhân 3 lần thời gian chờ mỗi lần fail
         "socket_timeout"     : 8,
-        # Chống rate-limit từ YouTube: giãn cách nhẹ giữa các request
-        "sleep_interval_requests": 1,
-        "sleep_interval"     : 1,
-        "max_sleep_interval" : 3,
+        # Chống rate-limit từ YouTube: giãn cách giữa các request. LƯU Ý:
+        # sleep_interval/max_sleep_interval chỉ có tác dụng khi thực sự TẢI
+        # file (download=True) — bot luôn gọi extract_info(download=False) nên
+        # 2 giá trị này gần như không ảnh hưởng gì tới /play. Giá trị thật sự
+        # có tác dụng giảm rate-limit ở đây là sleep_interval_requests (áp
+        # dụng cho mọi request kể cả khi chỉ extract metadata).
+        "sleep_interval_requests": 3,
+        "sleep_interval"     : 3,
+        "max_sleep_interval" : 8,
         "ratelimit"          : 3_000_000,  # 3MB/s cap — tránh spike bị flag bot
     }
     if use_proxy:
@@ -343,12 +350,23 @@ def _ffmpeg_before(
     403 ngay cả khi URL còn hạn. Đây từng là nguyên nhân gây lỗi
     "HTTP error 403 Forbidden" / "Error opening input" ngay khi vừa PLAY.
 
+    -tls_verify 0: tắt xác thực chứng chỉ TLS phía ffmpeg (tên option ĐÚNG của
+    ffmpeg cho protocol TLS/HTTPS — KHÔNG phải "-no_check_certificate", đó là
+    tên flag của yt-dlp/curl, dùng nhầm trong ffmpeg sẽ báo lỗi "Unrecognized
+    option" và crash ngay khi mở bài). LƯU Ý bảo mật: mở khả năng MITM về lý
+    thuyết nếu proxy ác ý — nhưng hầu hết build ffmpeg vốn đã tắt sẵn TLS
+    verify theo mặc định (cần tự cấp CA bundle mới bật được), nên option này
+    chủ yếu là "chốt chặn" cho các build có bật sẵn, tránh ffmpeg fail
+    handshake khi 1 số proxy free/rẻ tự chèn/terminate TLS bằng chứng chỉ
+    self-signed.
+
     Buffer khởi động vừa phải (không cần lớn như hồi host cũ mạng chập chờn) —
     host hiện tại (Railway) đã xác nhận mạng ổn định, ưu tiên start nhanh.
     """
     probesize  = "96k"
     analyzedur = "1000000"  # 1s — đủ ổn định, không làm chậm start
     base = (
+        "-tls_verify 0 "
         "-reconnect 1 "
         "-reconnect_streamed 1 "
         "-reconnect_delay_max 2 "         # giảm từ 5s→2s: rút ngắn thời gian "đứng
@@ -746,13 +764,19 @@ class Track:
                 # kiểu app-token, KHÔNG dùng session cookie. Nếu truyền cookies=True,
                 # yt-dlp sẽ tự SKIP hẳn các client này (mất hết format), không phải
                 # chỉ đơn thuần "thử cookie cho chắc" — đã test và xác nhận tệ hơn.
+                # Thêm "tv" — client YouTube ít bị soi hơn (đang là default của
+                # chính yt-dlp cùng ios/web từ giữa 2025).
                 opts = _ytdl_opts(False, use_proxy=use_proxy)
-                opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr"],
+                opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr", "tv"],
                                                        "skip": ["translated_subs", "comments"]}
             elif attempt == 1:
-                # web + cookies + PO-Token — combo đúng nếu video chưa bị SABR khoá
+                # web + cookies + PO-Token — combo đúng nếu video chưa bị SABR khoá.
+                # Thêm "mweb" (mobile web) — LƯU Ý: mweb từng KHÔNG cần PO-Token
+                # nhưng yt-dlp đã đổi default sang "tv" vì mweb giờ cũng hay cần
+                # PO-Token rồi (không còn bền như trước) — vẫn giữ làm phương án
+                # phụ, không kỳ vọng nhiều.
                 opts = _ytdl_opts(True, use_proxy=use_proxy)
-                opts["extractor_args"]["youtube"] = {"player_client": ["web"],
+                opts["extractor_args"]["youtube"] = {"player_client": ["web", "mweb"],
                                                        "skip": ["translated_subs", "comments"]}
             elif attempt == 2:
                 # ios KHÔNG dùng cookies — nếu không yt-dlp sẽ tự skip client này
@@ -761,7 +785,7 @@ class Track:
                                                        "skip": ["translated_subs", "comments"]}
             else:  # attempt 3 — phương án cuối, CÓ proxy
                 opts = _ytdl_opts(False, use_proxy=use_proxy)
-                opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr"],
+                opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr", "tv"],
                                                        "skip": ["translated_subs", "comments"]}
             logger.info("Client rotation | attempt %d → %s (proxy=%s)", attempt + 1,
                         opts["extractor_args"]["youtube"]["player_client"],
@@ -867,7 +891,7 @@ class Track:
                 # sửa qua cơ chế STREAM DROP giữa chừng → gây giật ngay đầu bài.
                 proxy_opts = _ytdl_opts(True, use_proxy=True)
                 proxy_opts["extractor_args"]["youtube"] = {
-                    "player_client": ["android", "tv_embedded", "android_vr"],
+                    "player_client": ["android", "tv_embedded", "android_vr", "tv"],
                     "skip": ["translated_subs", "comments"],
                 }
                 data = await loop.run_in_executor(None, _extract_sync, proxy_opts, video_url)
@@ -913,7 +937,7 @@ class Track:
                 # từng khiến refresh mất tới 52s chỉ để fail vô ích.
                 opts = _ytdl_opts(cookies=False, use_proxy=use_proxy)
                 opts["extractor_args"] = {
-                    "youtube": {"player_client": ["android", "tv_embedded", "android_vr"],
+                    "youtube": {"player_client": ["android", "tv_embedded", "android_vr", "tv"],
                                 "skip": ["translated_subs", "comments"]},
                     "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
                 }
@@ -2691,7 +2715,7 @@ class Music(commands.Cog):
                     r = await client.get(
                         "https://open.spotify.com/oembed",
                         params={"url": clean_url},
-                        headers={"User-Agent": "Mozilla/5.0"},
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
                     )
                 if r.status_code == 200:
                     title = r.json().get("title", "").strip()
@@ -2720,7 +2744,7 @@ class Music(commands.Cog):
             async with _httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
                 resp = await client.get(
                     track_url,
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
                 )
             if resp.status_code != 200:
                 return None
