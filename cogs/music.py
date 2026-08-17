@@ -271,7 +271,7 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     player_clients = ["tv", "web", "android", "ios"] if cookie_file_exists else ["tv", "tv_embedded", "android_vr", "ios"]
 
     opts: dict[str, Any] = {
-        "format"          : "bestaudio/best/18",  # 18 = progressive mp4 fallback, gần như luôn có
+        "format"          : "bestaudio/best/18/140/251",  # 18=progressive mp4, 140=m4a, 251=opus — fallback tường minh khi bestaudio selector không match được (client trả format thiếu tag acodec/vcodec)
         "default_search"  : "ytsearch",
         "noplaylist"      : False,
         "quiet"           : True,
@@ -375,6 +375,9 @@ def _ffmpeg_before(
         "-reconnect_at_eof 1 "
         "-reconnect_on_network_error 1 "
         "-reconnect_on_http_error 5xx "   # chỉ retry 5xx, KHÔNG retry 4xx (403 = cần URL mới)
+        "-limit_rate 3M "                 # cap 3MB/s — audio thường chỉ ~16-32KB/s
+                                           # thật nên không ảnh hưởng phát mượt, chỉ chặn
+                                           # spike-download bất thường dễ bị flag bot
         f"-analyzeduration {analyzedur} "
         f"-probesize {probesize} "
         "-rw_timeout 15000000"            # 15s — tránh treo vô hạn nếu mạng đứng hình hẳn
