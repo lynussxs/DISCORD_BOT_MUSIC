@@ -375,9 +375,12 @@ def _ffmpeg_before(
         "-reconnect_at_eof 1 "
         "-reconnect_on_network_error 1 "
         "-reconnect_on_http_error 5xx "   # chỉ retry 5xx, KHÔNG retry 4xx (403 = cần URL mới)
-        "-limit_rate 3M "                 # cap 3MB/s — audio thường chỉ ~16-32KB/s
-                                           # thật nên không ảnh hưởng phát mượt, chỉ chặn
-                                           # spike-download bất thường dễ bị flag bot
+        # ĐÃ THỬ "-limit_rate 3M" nhưng KHÔNG PHẢI flag hợp lệ của ffmpeg
+        # (nhầm theo kiểu đặt tên "curl --limit-rate") — gây lỗi
+        # "Unrecognized option 'limit_rate'" khiến ffmpeg từ chối parse toàn
+        # bộ before_options, mọi bài phát đều fail ngay lập tức. Đã gỡ hẳn,
+        # không thêm lại option throttle rate cho ffmpeg nữa trừ khi xác minh
+        # kỹ tên option đúng trước.
         f"-analyzeduration {analyzedur} "
         f"-probesize {probesize} "
         "-rw_timeout 15000000"            # 15s — tránh treo vô hạn nếu mạng đứng hình hẳn
