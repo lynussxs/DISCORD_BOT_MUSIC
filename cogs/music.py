@@ -884,7 +884,16 @@ class Track:
                 is_rate_limit = is_bot_check or any(x in err_str for x in [
                     "Requested format", "403", "429",
                     "Connection refused", "Connection reset", "Unable to download",
-                    "407", "Proxy Authentication"
+                    "407", "Proxy Authentication",
+                    # "DRM protected" — QUAN TRỌNG: đây là lỗi CLIENT-SPECIFIC, không
+                    # phải thuộc tính cố định của video. tv_embedded/tv đôi khi chỉ
+                    # trả về format list toàn DRM cho 1 video, trong khi android/ios/
+                    # web vẫn lấy được format thường bình thường CHO CÙNG VIDEO ĐÓ.
+                    # Trước đây coi lỗi này là "hết cách" → bỏ cuộc ngay sau attempt 0
+                    # (tv_embedded/tv), chưa từng thử tới android/ios/web — sai, vì
+                    # DRM thật (video thực sự bị khoá) sẽ fail y hệt ở CẢ 4 client,
+                    # lúc đó mới nên kết luận là hết cách.
+                    "DRM protected", "DRM-protected",
                 ])
 
                 if is_rate_limit and attempt < 3:
