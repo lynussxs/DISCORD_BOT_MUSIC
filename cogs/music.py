@@ -268,10 +268,16 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     # Thêm "tv" — hiện là 1 trong các client MẶC ĐỊNH của chính yt-dlp (cùng
     # ios/web) từ giữa 2025, khá bền với PO-Token so với mweb/web đơn thuần.
     cookie_file_exists = cookies and _cookies_valid()
-    player_clients = ["tv", "web", "android", "ios"] if cookie_file_exists else ["tv", "tv_embedded", "android_vr", "ios"]
+    player_clients = ["tv", "web", "android", "ios"] if cookie_file_exists else ["tv", "tv_embedded", "ios", "android_vr"]
 
     opts: dict[str, Any] = {
         "format"          : "bestaudio/best/18/140/251",  # 18=progressive mp4, 140=m4a, 251=opus — fallback tường minh khi bestaudio selector không match được (client trả format thiếu tag acodec/vcodec)
+        # Ưu tiên định dạng HLS (m3u8, tv_embedded trả về loại này) hơn DASH/
+        # progressive thường — HLS hiện CHƯA bị YouTube bắt buộc PO-Token,
+        # trong khi non-HLS âm thanh (itag 251/140 từ android/android_vr) thì
+        # có. Chỉ có tác dụng khi 1 lần extract trộn nhiều client cùng lúc
+        # (attempt cuối) — các attempt tách riêng client thì không bị ảnh hưởng.
+        "format_sort"     : ["proto:m3u8_native", "abr"],
         "default_search"  : "ytsearch",
         "noplaylist"      : False,
         "quiet"           : True,
@@ -761,19 +767,24 @@ class Track:
             #     SABR-only streaming (không lộ URL trực tiếp nữa), KHÔNG phải
             #     lỗi cookie/PO-Token — không có cách nào fix từ phía yt-dlp.
             #   attempt 2: ios, KHÔNG proxy — tương tự, giữ làm phương án phụ.
-            #   attempt 3: android/tv_embedded/android_vr, CÓ proxy — chỉ khi
-            #     cả 3 lần direct đều fail (hiếm, có thể do IP server bị chặn).
+            #   attempt 3: android/tv_embedded/android_vr/tv, CÓ proxy — chỉ
+            #     khi cả 3 lần trước đều fail (hiếm, có thể do IP server bị chặn).
             use_proxy = (attempt == 3)
 
             if attempt == 0:
-                # KHÔNG dùng cookies — ios/android/tv_embedded/android_vr là client
-                # kiểu app-token, KHÔNG dùng session cookie. Nếu truyền cookies=True,
-                # yt-dlp sẽ tự SKIP hẳn các client này (mất hết format), không phải
-                # chỉ đơn thuần "thử cookie cho chắc" — đã test và xác nhận tệ hơn.
-                # Thêm "tv" — client YouTube ít bị soi hơn (đang là default của
-                # chính yt-dlp cùng ios/web từ giữa 2025).
+                # ĐỔI THỨ TỰ (17/08/2026): tv_embedded/tv lên ĐẦU, android/
+                # android_vr bị đẩy xuống attempt cuối. Lý do: android/
+                # android_vr giờ yêu cầu GVS PO-Token cho MỌI itag TRỪ 18 —
+                # itag 251 (audio-only, cái bot luôn chọn) LUÔN cần token,
+                # trong khi tv_embedded trả về định dạng HLS (m3u8) mà theo
+                # tài liệu yt-dlp hiện tại CHƯA cần PO-Token. Quan trọng hơn:
+                # trước đây gộp chung android_vr + tv_embedded trong CÙNG 1
+                # lần extract khiến yt-dlp merge format rồi ưu tiên chọn
+                # format của android_vr (bitrate cao hơn) thay vì HLS của
+                # tv_embedded — dù tv_embedded có mặt cũng vô nghĩa. Giờ tách
+                # hẳn ra 1 attempt riêng, không còn ai "giành" format nữa.
                 opts = _ytdl_opts(False, use_proxy=use_proxy)
-                opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr", "tv"],
+                opts["extractor_args"]["youtube"] = {"player_client": ["tv_embedded", "tv"],
                                                        "skip": ["translated_subs", "comments"]}
             elif attempt == 1:
                 # web + cookies + PO-Token — combo đúng nếu video chưa bị SABR khoá.
@@ -789,9 +800,10 @@ class Track:
                 opts = _ytdl_opts(False, use_proxy=use_proxy)
                 opts["extractor_args"]["youtube"] = {"player_client": ["ios"],
                                                        "skip": ["translated_subs", "comments"]}
-            else:  # attempt 3 — phương án cuối, CÓ proxy
+            else:  # attempt 3 — phương án cuối, CÓ proxy — gộp lại full combo kể
+                   # cả android/android_vr (đôi khi vẫn hoạt động, không loại hẳn)
                 opts = _ytdl_opts(False, use_proxy=use_proxy)
-                opts["extractor_args"]["youtube"] = {"player_client": ["android", "tv_embedded", "android_vr", "tv"],
+                opts["extractor_args"]["youtube"] = {"player_client": ["tv_embedded", "tv", "android", "android_vr"],
                                                        "skip": ["translated_subs", "comments"]}
             logger.info("Client rotation | attempt %d → %s (proxy=%s)", attempt + 1,
                         opts["extractor_args"]["youtube"]["player_client"],
@@ -889,15 +901,15 @@ class Track:
             if use_forced_us:
                 _proxy.force_us()
             try:
-                # QUAN TRỌNG: phải chỉ định LẠI đúng player_client đã thành công
-                # (android/tv_embedded/android_vr) — nếu không, _ytdl_opts() sẽ
-                # dùng client mặc định (có "web", dễ dính SABR/"Requested format
-                # is not available"). Trước đây thiếu dòng này khiến re-fetch
-                # FAIL GẦN NHƯ 100% MỌI LẦN, phải đợi tới lúc đang phát mới được
-                # sửa qua cơ chế STREAM DROP giữa chừng → gây giật ngay đầu bài.
+                # QUAN TRỌNG: phải chỉ định LẠI đúng player_client (không dùng
+                # default của _ytdl_opts() vì mặc định có "web", dễ dính SABR/
+                # "Requested format is not available"). tv_embedded/tv lên đầu
+                # (HLS, chưa cần PO-Token) — android/android_vr chỉ làm phương
+                # án phụ vì itag 251 chúng trả về giờ cần PO-Token mà bgutil-pot
+                # tự thừa nhận "không còn bypass được đa số trường hợp" (17/08/2026).
                 proxy_opts = _ytdl_opts(True, use_proxy=True)
                 proxy_opts["extractor_args"]["youtube"] = {
-                    "player_client": ["android", "tv_embedded", "android_vr", "tv"],
+                    "player_client": ["tv_embedded", "tv", "android", "android_vr"],
                     "skip": ["translated_subs", "comments"],
                 }
                 data = await loop.run_in_executor(None, _extract_sync, proxy_opts, video_url)
@@ -935,15 +947,16 @@ class Track:
         proxy_order = (True,) if force_proxy else (False, True)
         for use_proxy in proxy_order:
             try:
-                # QUAN TRỌNG: ép dùng client tv_embedded/android_vr (đã CHỨNG MINH
-                # hoạt động — đây chính là client resolve thành công lần đầu).
-                # KHÔNG dùng default của _ytdl_opts(), vì mặc định ưu tiên
-                # web/android/ios khi có cookies.txt — 2 client này thường xuyên
-                # fail "Requested format is not available" trên server hiện tại,
-                # từng khiến refresh mất tới 52s chỉ để fail vô ích.
+                # QUAN TRỌNG: ép dùng client tv_embedded/tv trước (HLS, chưa cần
+                # PO-Token) — KHÔNG dùng default của _ytdl_opts(), vì mặc định
+                # ưu tiên web/android/ios khi có cookies.txt, 2 client này
+                # thường xuyên fail "Requested format is not available". Nếu
+                # bài vừa fail vì 403/PO-Token (như android_vr itag 251), thử
+                # lại đúng client cũ chỉ fail y hệt lần nữa — đổi sang
+                # tv_embedded trước mới có cơ hội thoát khỏi vòng lặp 403.
                 opts = _ytdl_opts(cookies=False, use_proxy=use_proxy)
                 opts["extractor_args"] = {
-                    "youtube": {"player_client": ["android", "tv_embedded", "android_vr", "tv"],
+                    "youtube": {"player_client": ["tv_embedded", "tv", "android", "android_vr"],
                                 "skip": ["translated_subs", "comments"]},
                     "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
                 }
