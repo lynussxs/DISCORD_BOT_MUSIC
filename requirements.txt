@@ -9,17 +9,21 @@ davey>=0.1.5
 PyNaCl>=1.5.0
 
 # YouTube audio extraction and streaming
-# Ghim version mới để tránh lỗi "Requested format is not available" do YouTube
-# liên tục đổi cách trả stream (SABR/PO-Token) — bản cũ hay bị lỗi.
+# KHÔNG ghim version cứng (dùng >=) — cố ý để luôn lấy bản MỚI NHẤT mỗi lần
+# build, vì YouTube liên tục đổi cách trả stream (SABR/PO-Token) và yt-dlp vá
+# theo gần như hàng tuần — bản cũ dễ bị "Requested format is not available".
 yt-dlp>=2026.7.4
+
+# --- Có thể KHÔNG còn dùng nữa — kiểm tra bằng:
+#   grep -rn "youtube_search\|import requests\|import anthropic" --include="*.py" .
+# Nếu không có import nào khác ngoài chính dòng khai báo package → xoá được.
 youtube-search-python
 requests
-spotipy
 anthropic
+# ---
+
+spotipy
 httpx
-playwright>=1.40.0
-wavelink>=3.4.0
-wavelink
 
 # Loads .env files into os.environ
 python-dotenv>=1.0.0
