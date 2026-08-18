@@ -28,6 +28,7 @@ Commands: /play /pause /resume /skip /stop /queue /nowplaying /volume
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import json
 import os
@@ -322,11 +323,10 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
             parsed = urllib.parse.urlparse(proxy)
             if parsed.username and parsed.password:
                 opts["http_headers"] = opts.get("http_headers", {})
-                import base64
                 creds = base64.b64encode(f"{parsed.username}:{parsed.password}".encode()).decode()
                 opts["http_headers"]["Proxy-Authorization"] = f"Basic {creds}"
     if cookies:
-        cp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt")
+        cp = _cookiefile_path()
         if os.path.exists(cp):
             opts["cookiefile"] = cp
     return opts
@@ -643,14 +643,66 @@ async def _piped_fallback(video_id: str, loop: asyncio.AbstractEventLoop) -> dic
         return await _invidious_fallback(video_id, client)
 
 
+def _cookiefile_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt")
+
+
 def _cookies_valid() -> bool:
     """Kiểm tra cookies.txt có tồn tại và không rỗng — nếu không thì bot-check
     (Sign in to confirm you're not a bot) gần như chắc chắn không thể vượt qua."""
-    cp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt")
+    cp = _cookiefile_path()
     try:
         return os.path.exists(cp) and os.path.getsize(cp) > 100
     except OSError:
         return False
+
+
+def _bootstrap_cookiefile() -> None:
+    """
+    Tự sinh cookies.txt từ biến môi trường lúc khởi động — hữu ích khi deploy
+    (Railway...) không cho phép upload file trực tiếp vào container.
+
+    Hỗ trợ 2 cách:
+      1. YTDLP_COOKIES_B64          — 1 biến duy nhất (base64 của cookies.txt).
+      2. YTDLP_COOKIES_B64_1, _2, _3, ... — chia nhiều phần, bot tự nối lại
+         theo đúng thứ tự trước khi giải mã. BẮT BUỘC dùng cách này nếu chuỗi
+         base64 dài hơn 32768 ký tự — đây là giới hạn CỨNG của Railway cho 1
+         biến môi trường (thấy lỗi "Variable value exceeds maximum length of
+         32768" nếu cố nhét hết vào 1 biến).
+
+    Nếu cookies.txt đã tồn tại sẵn (VD build từ Docker image có sẵn file) thì
+    KHÔNG ghi đè — chỉ sinh khi file chưa có/rỗng.
+    """
+    cp = _cookiefile_path()
+    if _cookies_valid():
+        return  # đã có sẵn cookies.txt hợp lệ, không đụng vào
+
+    # Ưu tiên ghép nhiều phần YTDLP_COOKIES_B64_1, _2, _3... nếu có
+    parts: list[str] = []
+    i = 1
+    while True:
+        val = os.environ.get(f"YTDLP_COOKIES_B64_{i}", "")
+        if not val:
+            break
+        parts.append(val)
+        i += 1
+
+    b64 = "".join(parts) if parts else os.environ.get("YTDLP_COOKIES_B64", "")
+    if not b64:
+        return  # không có biến nào được set — bỏ qua, dùng cookies.txt cũ nếu có
+
+    try:
+        raw = base64.b64decode(b64)
+        with open(cp, "wb") as f:
+            f.write(raw)
+        source = f"{len(parts)} phần YTDLP_COOKIES_B64_1..{len(parts)}" if parts else "YTDLP_COOKIES_B64"
+        logger.info("cookies.txt đã được sinh tự động từ %s (%d byte).", source, len(raw))
+    except Exception as exc:
+        logger.warning("Không thể sinh cookies.txt từ biến môi trường: %s", exc)
+
+
+_bootstrap_cookiefile()
+
 
 class Track:
     """Metadata + streaming URL for one song, resolved by yt-dlp."""
