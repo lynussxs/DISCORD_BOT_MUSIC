@@ -880,26 +880,23 @@ class Track:
                 if is_truly_unavailable:
                     raise last_err
 
-                is_bot_check = "Sign in to confirm" in err_str or "not a bot" in err_str
-                is_rate_limit = is_bot_check or any(x in err_str for x in [
-                    "Requested format", "403", "429",
-                    "Connection refused", "Connection reset", "Unable to download",
-                    "407", "Proxy Authentication",
-                    # "DRM protected" — QUAN TRỌNG: đây là lỗi CLIENT-SPECIFIC, không
-                    # phải thuộc tính cố định của video. tv_embedded/tv đôi khi chỉ
-                    # trả về format list toàn DRM cho 1 video, trong khi android/ios/
-                    # web vẫn lấy được format thường bình thường CHO CÙNG VIDEO ĐÓ.
-                    # Trước đây coi lỗi này là "hết cách" → bỏ cuộc ngay sau attempt 0
-                    # (tv_embedded/tv), chưa từng thử tới android/ios/web — sai, vì
-                    # DRM thật (video thực sự bị khoá) sẽ fail y hệt ở CẢ 4 client,
-                    # lúc đó mới nên kết luận là hết cách.
-                    "DRM protected", "DRM-protected",
-                ])
+                # QUAN TRỌNG (18/08/2026): ĐẢO NGƯỢC logic — trước đây dùng
+                # allowlist (chỉ retry nếu lỗi khớp 1 trong vài câu quen thuộc:
+                # "Requested format", "403", "Sign in to confirm"...). Cách này
+                # LUÔN đuổi theo sau, vì YouTube liên tục đổi câu thông báo mới
+                # ("DRM protected", "The page needs to be reloaded.", và chắc
+                # chắn còn nhiều câu khác nữa trong tương lai) — mỗi câu lạ
+                # không nằm trong allowlist khiến bot bỏ cuộc oan sau ĐÚNG 1
+                # lần thử (tv_embedded/tv), chưa từng thử qua android/ios/web dù
+                # 3 client đó có thể phát bình thường cho ĐÚNG video đó. Giờ mặc
+                # định LUÔN retry hết cả 4 attempt — chỉ dừng sớm ở nhánh
+                # is_truly_unavailable phía trên (video removed/private thật).
+                is_407 = "407" in err_str or "Proxy Authentication" in err_str
 
-                if is_rate_limit and attempt < 3:
+                if attempt < 3:
                     current = opts.get("proxy", "")
                     # 407 = proxy auth fail → mark dead permanent
-                    if "407" in err_str or "Proxy Authentication" in err_str:
+                    if is_407:
                         if current:
                             _proxy.mark_dead(current, temporary=False)
                             # Nếu proxy US bị 407 (auth fail) → đừng force lại nó
@@ -914,8 +911,9 @@ class Track:
                     # thời gian user chờ nhạc phát.
                     delay = 1.5
                     logger.warning(
-                        "yt-dlp attempt %d failed, waiting %.1fs (proxy=%s)",
-                        attempt + 1, delay, current[-15:] if current else "none",
+                        "yt-dlp attempt %d failed (%s), waiting %.1fs (proxy=%s)",
+                        attempt + 1, err_str[:80].replace("\n", " "), delay,
+                        current[-15:] if current else "none",
                     )
                     await asyncio.sleep(delay)
                     continue
