@@ -308,9 +308,9 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
         # 2 giá trị này gần như không ảnh hưởng gì tới /play. Giá trị thật sự
         # có tác dụng giảm rate-limit ở đây là sleep_interval_requests (áp
         # dụng cho mọi request kể cả khi chỉ extract metadata).
-        "sleep_interval_requests": 3,
-        "sleep_interval"     : 3,
-        "max_sleep_interval" : 8,
+        "sleep_interval_requests": 1,
+        "sleep_interval"     : 1,
+        "max_sleep_interval" : 3,
         "ratelimit"          : 3_000_000,  # 3MB/s cap — tránh spike bị flag bot
     }
     if use_proxy:
@@ -909,7 +909,7 @@ class Track:
                     # "Requested format" trên web/ios thường do YouTube khoá SABR-only,
                     # KHÔNG phải rate-limit → chờ lâu hơn cũng không giúp gì, chỉ tốn
                     # thời gian user chờ nhạc phát.
-                    delay = 1.5
+                    delay = 0.6
                     logger.warning(
                         "yt-dlp attempt %d failed (%s), waiting %.1fs (proxy=%s)",
                         attempt + 1, err_str[:80].replace("\n", " "), delay,
@@ -1560,6 +1560,7 @@ class GuildPlayer:
         # phát bị lỗi (queue tạm rỗng) và bài tiếp theo vẫn đang tải.
         self.pending_resolves: int = 0
         self._start: float | None  = None
+        self._attempt_start: float | None = None  # thời điểm play/resume gần nhất — dùng cho heuristic phát hiện fail-sớm-câm-lặng
         self.loop: bool            = False
         self.shuffle: bool         = False
         self.autoplay: bool        = False
@@ -1709,6 +1710,7 @@ class GuildPlayer:
                     track = self._queue.pop(0)
                 self.current = track
                 self._start  = time.monotonic()
+                self._attempt_start = time.monotonic()
                 logger.info(
                     "PLAY | '%s' (%.0fs) vol=%.0f%% queue=%d [guild %d]",
                     track.title, track.duration, self.volume * 100,
@@ -1733,6 +1735,7 @@ class GuildPlayer:
                     )
                     self.current = None
                     self._start  = None
+                    self._attempt_start = None
                     self._next.set()
                     continue
 
@@ -1781,6 +1784,7 @@ class GuildPlayer:
                         pass
                     self.current = None
                     self._start  = None
+                    self._attempt_start = None
                     return  # thoát player loop — sẽ được tạo lại ở lần /play tiếp theo
 
                 self.vc.play(source, after=_after)
@@ -1852,14 +1856,27 @@ class GuildPlayer:
                         # gây lỗi thật (như log 403 Forbidden ngay khi PLAY), khiến
                         # bot "chết lặng" — không retry, không báo lỗi, chỉ ngồi
                         # yên tới lúc auto-disconnect. Bù lại bằng heuristic: nếu
-                        # phát "xong" sớm bất thường so với duration thật (dưới 5s
-                        # hoặc <5% độ dài bài) → gần như chắc chắn là lỗi mở stream
-                        # câm lặng, không phải hết bài thật — coi như cần retry y
-                        # hệt nhánh 403.
+                        # LẦN THỬ HIỆN TẠI (không phải cả bài) chết sớm bất thường
+                        # → gần như chắc chắn là lỗi mở stream câm lặng.
+                        #
+                        # BUG ĐÃ SỬA (18/08/2026): heuristic cũ dùng `elapsed`
+                        # (vị trí TUYỆT ĐỐI trong bài) — sau khi resume ở giây 20s
+                        # chẳng hạn, nếu ffmpeg chết ngay lập tức LẦN NỮA thì
+                        # `elapsed` vẫn ~20s (không gần 0) → heuristic không nhận
+                        # ra đây cũng là fail-sớm-câm-lặng, bỏ cuộc luôn không
+                        # retry tiếp dù còn nguyên hạn mức retry — khiến bài
+                        # "chết lặng" ngay sau lần resume đầu tiên. Giờ dùng
+                        # `attempt_elapsed` (thời gian kể từ LẦN PLAY/RESUME GẦN
+                        # NHẤT, luôn reset về gần 0 mỗi lần retry) thay vì
+                        # `elapsed` (vị trí tuyệt đối, chỉ tăng dần suốt cả bài).
+                        attempt_elapsed = (
+                            time.monotonic() - self._attempt_start
+                            if self._attempt_start else elapsed
+                        )
                         ended_too_early = (
                             track.duration > 10
                             and not is_403 and not is_eof
-                            and elapsed < min(5, track.duration * 0.05)
+                            and attempt_elapsed < 5
                         )
                         should_retry = is_403 or is_eof or ended_too_early
                         if track.duration > 0 and elapsed < track.duration - 5 and should_retry:
@@ -1903,6 +1920,7 @@ class GuildPlayer:
                                 # (vd kiểm tra "gần hết bài chưa" bị sai) và cả progress
                                 # bar hiển thị lệch so với audio thực tế đang nghe.
                                 self._start = time.monotonic() - seek_pos
+                                self._attempt_start = time.monotonic()
                                 logger.info("STREAM RESUMED (%s attempt %d) at %.1fs for '%s'",
                                             reason, retries + 1, seek_pos, track.title)
                                 continue
@@ -1939,6 +1957,7 @@ class GuildPlayer:
                 await self._expire_np_message()
 
                 self._start  = None
+                self._attempt_start = None
                 self.current = None
 
                 # ── Thông báo hết nhạc nếu queue trống — xoá hẳn MUSIC PANEL cũ,
