@@ -696,7 +696,8 @@ def _bootstrap_cookiefile() -> None:
     """
     cp = _cookiefile_path()
     if _cookies_valid():
-        return  # đã có sẵn cookies.txt hợp lệ, không đụng vào
+        logger.info("cookies.txt đã có sẵn và hợp lệ — bỏ qua bootstrap từ biến môi trường.")
+        return
 
     # Ưu tiên ghép nhiều phần YTDLP_COOKIES_B64_1, _2, _3... nếu có
     parts: list[str] = []
@@ -710,7 +711,17 @@ def _bootstrap_cookiefile() -> None:
 
     b64 = "".join(parts) if parts else os.environ.get("YTDLP_COOKIES_B64", "")
     if not b64:
-        return  # không có biến nào được set — bỏ qua, dùng cookies.txt cũ nếu có
+        # QUAN TRỌNG: trước đây return im lặng ở đây — không cách nào biết
+        # được là do thiếu biến môi trường hay do lỗi khác. Giờ log rõ ràng
+        # để không còn debug mù nữa.
+        logger.warning(
+            "Không tìm thấy YTDLP_COOKIES_B64 hoặc YTDLP_COOKIES_B64_1 nào trong "
+            "biến môi trường — cookies.txt sẽ KHÔNG được tự sinh. Kiểm tra lại "
+            "tên biến đã set trên Railway (Variables tab) có đúng chính xác "
+            "'YTDLP_COOKIES_B64_1', '_2', '_3'... không (phân biệt hoa/thường, "
+            "không thừa khoảng trắng)."
+        )
+        return
 
     try:
         raw = base64.b64decode(b64)
@@ -718,6 +729,16 @@ def _bootstrap_cookiefile() -> None:
             f.write(raw)
         source = f"{len(parts)} phần YTDLP_COOKIES_B64_1..{len(parts)}" if parts else "YTDLP_COOKIES_B64"
         logger.info("cookies.txt đã được sinh tự động từ %s (%d byte).", source, len(raw))
+        if not _cookies_valid():
+            logger.warning(
+                "cookies.txt VỪA được sinh nhưng vẫn KHÔNG hợp lệ (thiếu cookie "
+                "xác thực đăng nhập như SAPISID/APISID/SID/HSID/LOGIN_INFO). "
+                "Nhiều khả năng lúc export cookie từ trình duyệt, tài khoản Google "
+                "chưa thật sự đăng nhập, hoặc extension export thiếu cookie "
+                "'HttpOnly' (1 số extension bỏ sót). Thử export lại bằng "
+                "'Get cookies.txt LOCALLY' trong lúc đã chắc chắn đăng nhập "
+                "YouTube/Google, mở đúng trang youtube.com trước khi export."
+            )
     except Exception as exc:
         logger.warning("Không thể sinh cookies.txt từ biến môi trường: %s", exc)
 
