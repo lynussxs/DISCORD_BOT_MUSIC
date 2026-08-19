@@ -993,11 +993,20 @@ class Track:
         return (time.monotonic() - self._url_fetched_at) < 240  # 4 phút
 
     async def refresh_url(self, loop: asyncio.AbstractEventLoop, force: bool = False,
-                          force_proxy: bool = False) -> None:
+                          force_proxy: bool = False, force_itag18: bool = False) -> None:
         """
         Refresh stream URL.
         force=True      → re-resolve từ video ID, không dùng cache URL cũ.
         force_proxy=True→ bỏ qua direct, chỉ dùng proxy (dùng khi gcr=us geo-lock).
+        force_itag18=True → ép dùng itag 18 (progressive mp4 360p, có kèm
+            video) thay vì để yt-dlp tự chọn "bestaudio". itag 18 là định
+            dạng DUY NHẤT được xác nhận MIỄN PO-Token hoàn toàn (theo tracker
+            yt-dlp) — bestaudio hầu như luôn trỏ về itag 251/140 (cần
+            PO-Token, ngày càng bị YouTube siết chặt). Đánh đổi: tải dư phần
+            video (ffmpeg tự bỏ qua bằng -vn khi phát), chất lượng audio thấp
+            hơn (~96kbps AAC so với ~160kbps opus) — chấp nhận được khi mục
+            tiêu là "phát được" thay vì "phát hay nhất". Dùng làm phương án
+            thoát hiểm khi đã retry nhiều lần vẫn dính đúng 1 kiểu 403.
         """
         if not force and self.url_is_fresh:
             return
@@ -1019,6 +1028,8 @@ class Track:
                                 "skip": ["translated_subs", "comments"]},
                     "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
                 }
+                if force_itag18:
+                    opts["format"] = "18"
                 data = await loop.run_in_executor(None, _extract_sync, opts, self.webpage_url)
                 new_url = data.get("url", "")
                 if new_url and "youtube.com/watch" not in new_url:
@@ -1027,8 +1038,9 @@ class Track:
                     self._url_fetched_at = time.monotonic()
                     self._url_via_proxy = use_proxy
                     self._proxy_used = opts.get("proxy")
-                    logger.info("URL refreshed (%s) for '%s'",
-                                "proxy" if use_proxy else "direct", self.title)
+                    logger.info("URL refreshed (%s%s) for '%s'",
+                                "proxy" if use_proxy else "direct",
+                                ", itag18" if force_itag18 else "", self.title)
                     return
             except Exception as exc:
                 last_exc = exc
@@ -1895,7 +1907,17 @@ class GuildPlayer:
                                 is_geo_us = "gcr=us" in track.url
                                 if is_geo_us:
                                     _proxy.force_us()
-                                await track.refresh_url(self._loop, force=True, force_proxy=is_geo)
+                                # Sau 2 lần retry vẫn dính 403/EOF y hệt → gần như chắc
+                                # chắn cứ resolve lại cũng ra ĐÚNG itag 251/140 qua
+                                # android_vr (cần PO-Token) mỗi lần, lặp vô ích. Từ lần
+                                # thứ 3 trở đi, ép hẳn itag 18 (progressive mp4, MIỄN
+                                # PO-Token hoàn toàn) — chất lượng thấp hơn nhưng thoát
+                                # được vòng lặp 403 chắc chắn hơn nhiều.
+                                force_18 = (not is_eof) and retries >= 2
+                                await track.refresh_url(
+                                    self._loop, force=True, force_proxy=is_geo,
+                                    force_itag18=force_18,
+                                )
                                 _403_flag[0] = False
                                 _403_flag[2] = False
                                 _403_retries[0] += 1
