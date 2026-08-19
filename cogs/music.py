@@ -648,11 +648,32 @@ def _cookiefile_path() -> str:
 
 
 def _cookies_valid() -> bool:
-    """Kiểm tra cookies.txt có tồn tại và không rỗng — nếu không thì bot-check
-    (Sign in to confirm you're not a bot) gần như chắc chắn không thể vượt qua."""
+    """
+    Kiểm tra cookies.txt có tồn tại và THẬT SỰ dùng được — không chỉ "không
+    rỗng". Nếu không đủ điều kiện, bot-check (Sign in to confirm you're not a
+    bot) gần như chắc chắn không thể vượt qua.
+
+    LƯU Ý (phát hiện 19/08/2026): ngưỡng cũ chỉ check ">100 byte" — 1 file
+    RÁC/CŨ nằm sẵn trong container (1599 byte, 15 dòng, không có cookie đăng
+    nhập thật) vẫn "qua cửa" ngưỡng này, khiến _bootstrap_cookiefile() tưởng
+    đã có cookie hợp lệ sẵn rồi nên KHÔNG BAO GIỜ ghi đè bằng cookie thật từ
+    biến môi trường — cookie mới set qua YTDLP_COOKIES_B64_* im lặng vô tác
+    dụng suốt thời gian dài mà không ai biết. Giờ check chặt hơn: cookie thật
+    xuất từ browser cho youtube.com luôn có HÀNG CHỤC dòng (nhiều domain con
+    google/youtube khác nhau) VÀ phải có ít nhất 1 cookie xác thực đăng nhập
+    thật sự (SAPISID/APISID/SID/HSID/LOGIN_INFO) — thiếu là coi như vô dụng
+    dù file không rỗng.
+    """
     cp = _cookiefile_path()
     try:
-        return os.path.exists(cp) and os.path.getsize(cp) > 100
+        if not os.path.exists(cp) or os.path.getsize(cp) < 2048:
+            return False
+        with open(cp, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        has_auth_cookie = any(
+            name in content for name in ("SAPISID", "APISID", "SID\t", "HSID", "LOGIN_INFO")
+        )
+        return has_auth_cookie
     except OSError:
         return False
 
