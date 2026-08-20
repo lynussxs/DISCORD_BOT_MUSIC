@@ -996,15 +996,12 @@ class Track:
                     return cls(piped_data, requester, via_proxy=False)
 
             err_str = str(last_err)
-            if ("Sign in to confirm" in err_str or "not a bot" in err_str) and not _cookies_valid():
-                logger.error(
-                    "Bot-check thất bại vĩnh viễn — cookies.txt thiếu/rỗng! "
-                    "Cần export cookies YouTube hợp lệ và đặt tại cookies.txt (thư mục gốc bot)."
-                )
-                raise yt_dlp.utils.DownloadError(
-                    "YouTube yêu cầu xác thực (bot-check) và bot chưa có cookies hợp lệ. "
-                    "Cần cập nhật file cookies.txt."
-                )
+            # LƯU Ý: đã bỏ nhánh "Bot-check thất bại vĩnh viễn" từng có ở đây —
+            # nó suy luận sai. Lỗi cuối cùng luôn tới từ attempt cuối (proxy),
+            # và attempt đó theo THIẾT KẾ không bao giờ gửi cookie (bất kể
+            # cookies.txt tốt hay xấu) — nên "Sign in to confirm" ở bước này
+            # không phản ánh đúng tình trạng cookie thật. Cứ để lỗi gốc của
+            # yt-dlp hiện ra, chính xác hơn là tự đoán nhầm nguyên nhân.
             raise last_err  # type: ignore
 
         # ── Nếu URL có gcr=<country> → re-fetch qua proxy để tránh 403 khi stream ──
@@ -2311,12 +2308,12 @@ class Music(commands.Cog):
         except yt_dlp.utils.DownloadError as exc:
             logger.warning("yt-dlp DownloadError for '%s': %s", query, exc)
             exc_str = str(exc)
-            if "cookies" in exc_str.lower() or "bot-check" in exc_str.lower():
+            if "cookies" in exc_str.lower() or "sign in to confirm" in exc_str.lower():
                 await interaction.followup.send(
                     embed=_e_err(
                         "YouTube yêu cầu xác thực",
-                        "Bot đang bị YouTube nghi ngờ là bot và cần cookies hợp lệ để vượt qua.\n"
-                        "Admin cần cập nhật file `cookies.txt` (export cookies YouTube từ browser đã đăng nhập).",
+                        "YouTube đang chặn bot ở bài này (bot-check/PO-Token) dù đã thử nhiều "
+                        "client/proxy khác nhau. Thử lại sau ít phút hoặc thử bài/link khác.",
                     ),
                     ephemeral=True,
                 )
