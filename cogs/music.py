@@ -697,6 +697,7 @@ def _bootstrap_cookiefile() -> None:
     cp = _cookiefile_path()
     if _cookies_valid():
         logger.info("cookies.txt đã có sẵn và hợp lệ — bỏ qua bootstrap từ biến môi trường.")
+        _lock_cookiefile_readonly(cp)
         return
 
     # Ưu tiên ghép nhiều phần YTDLP_COOKIES_B64_1, _2, _3... nếu có
@@ -739,11 +740,32 @@ def _bootstrap_cookiefile() -> None:
                 "'Get cookies.txt LOCALLY' trong lúc đã chắc chắn đăng nhập "
                 "YouTube/Google, mở đúng trang youtube.com trước khi export."
             )
+        else:
+            _lock_cookiefile_readonly(cp)
     except Exception as exc:
         logger.warning("Không thể sinh cookies.txt từ biến môi trường: %s", exc)
 
 
+def _lock_cookiefile_readonly(cp: str) -> None:
+    """
+    Khoá cookies.txt thành chỉ-đọc (chmod 0444) — phòng trường hợp yt-dlp tự
+    ghi ngược lại cookie jar vào CHÍNH file này giữa lúc chạy (1 số phiên bản
+    yt-dlp có cơ chế tự "save" cookie jar sau mỗi request để cập nhật session
+    token mới nhận được). Nếu điều đó xảy ra và ghi ra 1 bản thiếu/hỏng, file
+    gốc coi như "chết" ngay giữa phiên chạy dù lúc khởi động vẫn còn hợp lệ —
+    đúng hiện tượng quan sát được (valid lúc boot, invalid lúc /play). Khoá
+    read-only khiến yt-dlp gặp lỗi permission khi cố ghi thay vì ghi đè âm
+    thầm — yt-dlp tự bỏ qua lỗi ghi cookie jar (không ảnh hưởng đọc/dùng
+    cookie để request), nhưng file gốc luôn được bảo toàn nguyên vẹn.
+    """
+    try:
+        os.chmod(cp, 0o444)
+    except OSError as exc:
+        logger.warning("Không khoá được cookies.txt thành read-only: %s", exc)
+
+
 _bootstrap_cookiefile()
+
 
 
 class Track:
