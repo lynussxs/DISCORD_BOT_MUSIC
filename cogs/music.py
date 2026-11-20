@@ -970,13 +970,13 @@ def _log_ffmpeg_stderr(source: Any) -> str:
 _YT_STRATEGIES: list[dict[str, Any]] = [
     # Thứ tự TĨNH theo kết quả log thực tế (11:19-11:44): 'web' (cookies) thành công ở hầu hết video;
     # 'embed_vr' cứu được video mà web trả "Requested format is not available" (nhưng URL android_vr
-    # hay 403 lần đầu → player tự refresh); tv/tv_ck/safari_ck/ios chưa lần nào thắng nên xếp sau.
+    # hay 403 lần đầu → player tự refresh); tv/tv_ck/ios chưa lần nào thắng nên xếp sau. safari_ck đã
+    # bỏ: 2/2 lần fail đúng như web ("Requested format...") mà tốn ~4.5s mỗi lần.
     {"name": "web",       "clients": ["web", "mweb"],                      "cookies": True,  "proxy": False},
     # web_embedded + android_vr: theo PO Token Guide của yt-dlp, 2 client này (cùng "tv")
     # là nhóm duy nhất không đòi PO Token — thử riêng để không "giành format" với nhau.
     {"name": "embed_vr",  "clients": ["web_embedded", "android_vr"],       "cookies": False, "proxy": False},
     {"name": "tv_ck",     "clients": ["tv"],                               "cookies": True,  "proxy": False},
-    {"name": "safari_ck", "clients": ["web_safari"],                       "cookies": True,  "proxy": False},
     {"name": "tv",        "clients": ["tv_embedded", "tv"],                "cookies": False, "proxy": False},
     {"name": "ios",       "clients": ["ios"],                              "cookies": False, "proxy": False},
     {"name": "proxy",     "clients": ["tv_embedded", "tv", "android", "android_vr"], "cookies": False, "proxy": True},
@@ -1077,8 +1077,15 @@ async def _resolve_stream(
     plan = _breaker.plan()
     last_err: Exception | None = None
     t_start = time.monotonic()
+    # Chỉ "phạt" chiến lược trong breaker khi 1 chiến lược KHÁC cuối cùng thắng ở video đó.
+    # Nếu mọi chiến lược đều fail thì lỗi nằm ở VIDEO (giới hạn tuổi, hội viên, bị gỡ...) chứ
+    # không phải chiến lược hỏng — phạt lúc đó sẽ khoá oan cả 'web' đang chạy tốt với video khác.
+    pending_fails: list[str] = []
+    skip_names: set[str] = set()
 
     for i, strat in enumerate(plan):
+        if strat["name"] in skip_names:
+            continue
         if i and time.monotonic() - t_start > _RESOLVE_TOTAL_BUDGET:
             logger.warning("RESOLVE | quá %.0fs, dừng thử thêm chiến lược", _RESOLVE_TOTAL_BUDGET)
             break
@@ -1096,6 +1103,8 @@ async def _resolve_stream(
                 timeout=_RESOLVE_ATTEMPT_TIMEOUT,
             )
             _breaker.ok(strat["name"])
+            for _n in pending_fails:
+                _breaker.fail(_n, vid)
             logger.info("RESOLVE OK | [%s] %.1fs", strat["name"], time.monotonic() - t0)
             return data, opts.get("proxy"), None
         except asyncio.TimeoutError:
@@ -1112,7 +1121,9 @@ async def _resolve_stream(
             if any(x in _low for x in _UNAVAILABLE_MARKERS) and "format" not in _low:
                 raise
 
-        _breaker.fail(strat["name"], vid)
+        pending_fails.append(strat["name"])
+        if strat["proxy"] and "sign in to confirm" in err_str.lower():
+            skip_names.add(strat["name"])   # bot-check qua proxy → proxy thứ 2 cũng IP datacenter, khỏi tốn thêm ~8s
         current = opts.get("proxy", "")
         if current:
             if "407" in err_str or "Proxy Authentication" in err_str:
@@ -1128,6 +1139,34 @@ async def _resolve_stream(
             await asyncio.sleep(0.3)
 
     return None, None, last_err
+
+
+async def _diagnose_failure(video_url: str, loop: asyncio.AbstractEventLoop) -> tuple[str, str]:
+    """
+    Khi MỌI chiến lược đều fail: hỏi yt-dlp thông tin metadata (không đòi format) để biết vì sao.
+    Trả về (tóm tắt để log, gợi ý tiếng Việt cho người dùng — rỗng nếu không rõ).
+    """
+    try:
+        opts = _ytdl_opts(True, use_proxy=False)
+        opts["extractor_args"]["youtube"] = {"player_client": ["web"], "skip": ["translated_subs", "comments"]}
+        opts["ignore_no_formats_error"] = True
+        info = await asyncio.wait_for(loop.run_in_executor(None, _extract_sync, opts, video_url), timeout=15.0)
+    except Exception as exc:  # noqa: BLE001
+        return f"chẩn đoán lỗi: {str(exc)[:120]}", ""
+    fmts = info.get("formats") or []
+    n_url = sum(1 for f in fmts if f.get("url"))
+    avail, age, live = info.get("availability"), info.get("age_limit"), info.get("live_status")
+    summary = f"availability={avail} age_limit={age} live_status={live} formats={len(fmts)} có_url={n_url}"
+    hint = ""
+    if (age or 0) >= 18 or avail == "needs_auth":
+        hint = "Video giới hạn độ tuổi/cần đăng nhập — tài khoản dùng cho cookies phải là tài khoản đã xác minh 18+."
+    elif avail in ("subscriber_only", "premium_only"):
+        hint = "Video chỉ dành cho hội viên kênh/YouTube Premium."
+    elif live in ("is_upcoming", "post_live"):
+        hint = "Video là buổi phát trực tiếp chưa/vừa kết thúc nên chưa lấy được stream."
+    elif fmts and n_url == 0:
+        hint = "YouTube không đưa link stream trực tiếp (SABR) cho video này — thử bản upload khác."
+    return summary, hint
 
 
 class _BufferedPCM(discord.AudioSource):
@@ -1341,10 +1380,19 @@ class Track:
             vid_match = re.search(r"(?:v=|/)([\w-]{11})(?:[&?/]|$)", video_url)
             if vid_match:
                 logger.warning("yt-dlp exhausted, trying Piped fallback for %s…", vid_match.group(1))
-                piped_data = await _piped_fallback(vid_match.group(1), loop)
+                # Giới hạn 8s: log thực tế instance Piped/Invidious công cộng đều 502/403/530,
+                # trước đây việc dò chúng tốn thêm ~14s trước khi báo lỗi.
+                try:
+                    piped_data = await asyncio.wait_for(_piped_fallback(vid_match.group(1), loop), timeout=8.0)
+                except asyncio.TimeoutError:
+                    piped_data = None
                 if piped_data:
                     # Piped/Invidious tự phục vụ URL của họ, không qua proxy Bright Data/Webshare
                     return cls(piped_data, requester, via_proxy=False)
+            summary, hint = await _diagnose_failure(video_url, loop)
+            logger.warning("DIAG | %s | %s", video_url, summary)
+            if last_err is not None:
+                last_err._diag_hint = hint  # type: ignore[attr-defined]
             # Để lỗi gốc của yt-dlp hiện ra (chính xác hơn việc tự đoán nguyên nhân).
             raise last_err  # type: ignore
 
@@ -2712,7 +2760,8 @@ class Music(commands.Cog):
                     embed=_e_err(
                         "YouTube yêu cầu xác thực",
                         "YouTube đang chặn bot ở bài này (bot-check/PO-Token) dù đã thử nhiều "
-                        "client/proxy khác nhau. Thử lại sau ít phút hoặc thử bài/link khác.",
+                        "client/proxy khác nhau. Thử lại sau ít phút hoặc thử bài/link khác."
+                        + (f"\n\n💡 {getattr(exc, '_diag_hint', '')}" if getattr(exc, "_diag_hint", "") else ""),
                     ),
                     ephemeral=True,
                 )
