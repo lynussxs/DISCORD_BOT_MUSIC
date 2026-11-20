@@ -3,7 +3,10 @@ discord.py[voice]>=2.3.2
 
 # davey is discord.py's low-level voice helper (installed automatically with [voice])
 # Listed explicitly so `pip install -r requirements.txt` always gets it
-davey>=0.1.5
+# GHIM <0.2: davey 0.2.0 + discord.py 2.7.1 làm phiên mã hoá E2EE (DAVE) KHÔNG BAO GIỜ
+# "ready" → bot gửi audio không mã hoá, Discord bỏ gói → bot "đang phát" nhưng
+# hoàn toàn im lặng. Bỏ ghim khi discord.py/davey phát hành bản vá chính thức.
+davey>=0.1.5,<0.2
 
 # PyNaCl — cryptographic library required for voice connections
 PyNaCl>=1.5.0
