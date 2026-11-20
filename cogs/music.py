@@ -968,19 +968,18 @@ def _log_ffmpeg_stderr(source: Any) -> str:
 # (half-open); fail tiếp là khoá lại ngay.
 
 _YT_STRATEGIES: list[dict[str, Any]] = [
-    {"name": "tv",       "clients": ["tv_embedded", "tv"],                 "cookies": False, "proxy": False},
+    # Thứ tự TĨNH theo kết quả log thực tế (11:19-11:44): 'web' (cookies) thành công ở hầu hết video;
+    # 'embed_vr' cứu được video mà web trả "Requested format is not available" (nhưng URL android_vr
+    # hay 403 lần đầu → player tự refresh); tv/tv_ck/safari_ck/ios chưa lần nào thắng nên xếp sau.
+    {"name": "web",       "clients": ["web", "mweb"],                      "cookies": True,  "proxy": False},
     # web_embedded + android_vr: theo PO Token Guide của yt-dlp, 2 client này (cùng "tv")
     # là nhóm duy nhất không đòi PO Token — thử riêng để không "giành format" với nhau.
-    {"name": "embed_vr", "clients": ["web_embedded", "android_vr"],        "cookies": False, "proxy": False},
-    {"name": "web",      "clients": ["web", "mweb"],                       "cookies": True,  "proxy": False},
-    # Có cookies thì dùng thêm 2 client "sống được" với tài khoản đăng nhập: web_safari
-    # (HLS không đòi PO Token) và tv (cần cookies/guest session, nếu không bị DRM/bot-check).
-    # Log 11:38: 'web' trả "Requested format is not available" cho 1 video (YouTube chỉ
-    # đưa SABR cho web) trong khi tv/embed_vr — chạy KHÔNG cookies — dính bot-check.
+    {"name": "embed_vr",  "clients": ["web_embedded", "android_vr"],       "cookies": False, "proxy": False},
+    {"name": "tv_ck",     "clients": ["tv"],                               "cookies": True,  "proxy": False},
     {"name": "safari_ck", "clients": ["web_safari"],                       "cookies": True,  "proxy": False},
-    {"name": "tv_ck",    "clients": ["tv"],                                "cookies": True,  "proxy": False},
-    {"name": "ios",      "clients": ["ios"],                               "cookies": False, "proxy": False},
-    {"name": "proxy",    "clients": ["tv_embedded", "tv", "android", "android_vr"], "cookies": False, "proxy": True},
+    {"name": "tv",        "clients": ["tv_embedded", "tv"],                "cookies": False, "proxy": False},
+    {"name": "ios",       "clients": ["ios"],                              "cookies": False, "proxy": False},
+    {"name": "proxy",     "clients": ["tv_embedded", "tv", "android", "android_vr"], "cookies": False, "proxy": True},
 ]
 
 _RESOLVE_ATTEMPT_TIMEOUT = 20.0   # tối đa cho 1 lần extract — tránh 1 attempt treo ăn hết thời gian
@@ -1029,11 +1028,12 @@ class _StrategyBreaker:
         proxies = [s for s in _YT_STRATEGIES if s["proxy"]]
         alive = [s for s in directs if not self.tripped(s["name"])]
         dead  = [s for s in directs if self.tripped(s["name"])]
-        # Thắng gần nhất lên trước; khi chưa chiến lược nào thắng mà cookies.txt hợp lệ thì
-        # ưu tiên chiến lược dùng cookies (tv/embed_vr không gửi cookies nên thường dính bot-check).
+        # Giữ thứ tự tĩnh (xếp theo hiệu quả thực tế). Không xếp theo "thắng gần nhất" nữa: lỗi
+        # "Requested format..."/"page needs to be reloaded" là theo TỪNG video, 1 video lạ thắng
+        # bằng embed_vr không có nghĩa web hỏng. Chỉ đẩy chiến lược dùng cookies xuống cuối khi
+        # cookies.txt không hợp lệ (gửi cookies rác vô ích).
         cookies_ok = _cookies_valid()
-        alive.sort(key=lambda s: (-self._ok_at.get(s["name"], 0.0),
-                                  0 if (cookies_ok and s["cookies"]) else 1))
+        alive.sort(key=lambda s: 1 if (s["cookies"] and not cookies_ok) else 0)
         # Chiến lược proxy thử 2 lần (lần fail đầu mark_dead proxy đó → lần 2 dùng proxy khác).
         return alive + proxies * 2 + dead
 
@@ -1348,57 +1348,16 @@ class Track:
             # Để lỗi gốc của yt-dlp hiện ra (chính xác hơn việc tự đoán nguyên nhân).
             raise last_err  # type: ignore
 
-        # ── Nếu URL có gcr=<country> → re-fetch qua proxy để tránh 403 khi stream ──
-        # TRƯỚC ĐÂY chỉ check "gcr=us" — video geo-lock nước khác (vd gcr=nl,
-        # gcr=de...) bị bỏ qua hoàn toàn, phát thẳng URL geo-mismatch → 403
-        # ngay khi ffmpeg mở stream. Giờ bắt MỌI mã quốc gia.
-        stream_url = data.get("url", "")
-        gcr_match = re.search(r"gcr=([a-z]{2})\b", stream_url)
-        # gcr=US xuất hiện cả khi URL phát trực tiếp từ IP server vẫn mở được (log 11:19:
-        # web resolve OK, gcr=US, ffmpeg phát bình thường không proxy). Re-fetch qua
-        # proxy lúc đó chỉ tốn ~2s và hay fail ("page needs to be reloaded"). Nên:
-        #  • đã resolve QUA proxy → URL khớp proxy đó rồi, khỏi re-fetch;
-        #  • resolve trực tiếp → thử Range request 2 byte (~0.3s); mở được thì giữ URL,
-        #    chỉ khi 403/timeout mới re-fetch qua proxy như cũ.
-        if gcr_match and not resolved_via_proxy:
-            try:
-                async with _httpx.AsyncClient(follow_redirects=True) as _c:
-                    if await _stream_url_reachable(_c, stream_url):
-                        logger.info("gcr=%s nhưng URL direct mở được — bỏ qua re-fetch proxy",
-                                    gcr_match.group(1).upper())
-                        gcr_match = None
-            except Exception:
-                pass
-        elif gcr_match:
-            gcr_match = None
+        # gcr=<country> trong URL KHÔNG có nghĩa là phải re-fetch qua proxy. Log 11:42: URL
+        # có ip=152.55.181.204 (IP Mỹ — chính IP egress của Railway) nên gcr=us là đúng nước của
+        # server; URL direct phát bình thường. Bản trước re-fetch qua proxy Mỹ thừa (tốn ~2s và
+        # fail "page needs to be reloaded"), còn bước kiểm tra Range bằng httpx thì bị 403 oan
+        # vì không gửi đúng header của yt-dlp. Giờ bỏ hẳn: URL direct cứ phát; nếu ffmpeg gặp
+        # 403 thì nhánh STREAM DROP trong player loop tự refresh (direct trước, proxy sau).
+        gcr_match = re.search(r"gcr=([a-z]{2})\b", data.get("url", ""))
         if gcr_match:
-            gcr_country = gcr_match.group(1).upper()
-            use_forced_us = gcr_country == "US" and bool(WebshareProxyManager.PROXY_US)
-            logger.info(
-                "gcr=%s detected, re-fetching via %s proxy for '%s'",
-                gcr_country, "US (forced)" if use_forced_us else "rotating pool",
-                data.get("title", "?"),
-            )
-            if use_forced_us:
-                _proxy.force_us()
-            try:
-                # QUAN TRỌNG: phải chỉ định LẠI đúng player_client (không dùng
-                # default của _ytdl_opts() vì mặc định có "web", dễ dính SABR/
-                # "Requested format is not available"). tv_embedded/tv lên đầu
-                # (HLS, chưa cần PO-Token) — android/android_vr chỉ làm phương
-                # án phụ vì itag 251 chúng trả về giờ cần PO-Token mà bgutil-pot
-                # tự thừa nhận "không còn bypass được đa số trường hợp" (17/08/2026).
-                proxy_opts = _ytdl_opts(True, use_proxy=True)
-                proxy_opts["extractor_args"]["youtube"] = {
-                    "player_client": ["tv_embedded", "tv", "android", "android_vr"],
-                    "skip": ["translated_subs", "comments"],
-                }
-                data = await loop.run_in_executor(None, _extract_sync, proxy_opts, video_url)
-                resolved_via_proxy = True
-                resolved_proxy_str = proxy_opts.get("proxy")
-                logger.info("gcr=%s re-fetch OK via proxy for '%s'", gcr_country, data.get("title", "?"))
-            except Exception as _e:
-                logger.warning("gcr=%s proxy re-fetch failed: %s — will retry on stream drop", gcr_country, _e)
+            logger.info("gcr=%s trong URL (%s) — phát luôn, 403 sẽ tự refresh",
+                        gcr_match.group(1).upper(), "qua proxy" if resolved_via_proxy else "direct")
 
         _resolve_cache_put(video_url, data, resolved_via_proxy, resolved_proxy_str)
         return cls(data, requester, via_proxy=resolved_via_proxy,
@@ -2380,7 +2339,7 @@ class GuildPlayer:
                                 # được vòng lặp 403 chắc chắn hơn nhiều.
                                 force_18 = (not is_eof) and retries >= 2
                                 await track.refresh_url(
-                                    self._loop, force=True, force_proxy=is_geo,
+                                    self._loop, force=True, force_proxy=False,  # direct trước, proxy sau (server ở Mỹ nên gcr=us hợp lệ)
                                     force_itag18=force_18,
                                 )
                                 _403_flag[0] = False
