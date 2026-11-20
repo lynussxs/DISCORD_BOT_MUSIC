@@ -975,7 +975,11 @@ class _StrategyBreaker:
         proxies = [s for s in _YT_STRATEGIES if s["proxy"]]
         alive = [s for s in directs if not self.tripped(s["name"])]
         dead  = [s for s in directs if self.tripped(s["name"])]
-        alive.sort(key=lambda s: -self._ok_at.get(s["name"], 0.0))  # sort ổn định: thắng gần nhất lên trước
+        # Thắng gần nhất lên trước; khi chưa chiến lược nào thắng mà cookies.txt hợp lệ thì
+        # ưu tiên chiến lược dùng cookies (tv/embed_vr không gửi cookies nên thường dính bot-check).
+        cookies_ok = _cookies_valid()
+        alive.sort(key=lambda s: (-self._ok_at.get(s["name"], 0.0),
+                                  0 if (cookies_ok and s["cookies"]) else 1))
         # Chiến lược proxy thử 2 lần (lần fail đầu mark_dead proxy đó → lần 2 dùng proxy khác).
         return alive + proxies * 2 + dead
 
@@ -1292,6 +1296,23 @@ class Track:
         # ngay khi ffmpeg mở stream. Giờ bắt MỌI mã quốc gia.
         stream_url = data.get("url", "")
         gcr_match = re.search(r"gcr=([a-z]{2})\b", stream_url)
+        # gcr=US xuất hiện cả khi URL phát trực tiếp từ IP server vẫn mở được (log 11:19:
+        # web resolve OK, gcr=US, ffmpeg phát bình thường không proxy). Re-fetch qua
+        # proxy lúc đó chỉ tốn ~2s và hay fail ("page needs to be reloaded"). Nên:
+        #  • đã resolve QUA proxy → URL khớp proxy đó rồi, khỏi re-fetch;
+        #  • resolve trực tiếp → thử Range request 2 byte (~0.3s); mở được thì giữ URL,
+        #    chỉ khi 403/timeout mới re-fetch qua proxy như cũ.
+        if gcr_match and not resolved_via_proxy:
+            try:
+                async with _httpx.AsyncClient(follow_redirects=True) as _c:
+                    if await _stream_url_reachable(_c, stream_url):
+                        logger.info("gcr=%s nhưng URL direct mở được — bỏ qua re-fetch proxy",
+                                    gcr_match.group(1).upper())
+                        gcr_match = None
+            except Exception:
+                pass
+        elif gcr_match:
+            gcr_match = None
         if gcr_match:
             gcr_country = gcr_match.group(1).upper()
             use_forced_us = gcr_country == "US" and bool(WebshareProxyManager.PROXY_US)
