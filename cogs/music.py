@@ -237,7 +237,7 @@ class WebshareProxyManager:
         """Ép dùng proxy US cho lần yt-dlp tiếp theo (bypass gcr=us geo-lock)."""
         if self.PROXY_US:
             self._force_us = True
-            logger.info("Forcing US proxy: %s", self.PROXY_US)
+            logger.info("Forcing US proxy: %s", re.sub(r"//[^@/]+@", "//***:***@", self.PROXY_US))
         else:
             logger.warning("PROXY_US chưa set — không thể bypass gcr=us!")
 
@@ -807,6 +807,28 @@ _bootstrap_cookiefile()
 
 
 
+class _CountingSource(discord.PCMVolumeTransformer):
+    """
+    PCMVolumeTransformer có đếm số byte PCM ffmpeg thực sự đã đưa ra. Dùng để
+    phân biệt 2 kiểu "không có tiếng":
+      • bytes_read == 0 sau vài giây → ffmpeg KẸT (không mở được/không tải được URL)
+      • bytes_read > 0 mà vẫn không nghe gì → lỗi phía Discord/voice (thiếu quyền
+        Speak, bot bị server-mute, DAVE/mã hoá voice...), không phải do YouTube.
+    """
+    def __init__(self, original, volume: float = 1.0) -> None:
+        super().__init__(original, volume)
+        self.bytes_read = 0
+        self.first_byte_at: float | None = None
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data:
+            if self.first_byte_at is None:
+                self.first_byte_at = time.monotonic()
+            self.bytes_read += len(data)
+        return data
+
+
 def _new_pcm(url: str, before_options: str, options: str) -> "discord.FFmpegPCMAudio":
     """
     Tạo FFmpegPCMAudio và GOM stderr của ffmpeg vào file tạm để ghi log khi bài
@@ -1226,7 +1248,7 @@ class Track:
                     _ffmpeg_before(no_proxy=True),
                     opts,
                 )
-                return discord.PCMVolumeTransformer(pcm, volume=safe_vol)
+                return _CountingSource(pcm, volume=safe_vol)
 
         pcm = _new_pcm(
             self.url,
@@ -1235,7 +1257,7 @@ class Track:
                            headers=self.http_headers),
             opts,
         )
-        return discord.PCMVolumeTransformer(pcm, volume=safe_vol)
+        return _CountingSource(pcm, volume=safe_vol)
 
 
 # ── Embed helpers ──────────────────────────────────────────────────────────────
@@ -1938,6 +1960,7 @@ class GuildPlayer:
                     return  # thoát player loop — sẽ được tạo lại ở lần /play tiếp theo
 
                 self.vc.play(source, after=_after)
+                asyncio.ensure_future(self._audio_watchdog(source, track.title))
 
                 # ── Now Playing message — xóa tin nhắn NP cũ ──────────────────
                 view = MusicControlView(self)
@@ -2158,6 +2181,25 @@ class GuildPlayer:
         except Exception as exc:
             logger.debug("Pre-load failed for '%s': %s", track.title, exc)
 
+    async def _audio_watchdog(self, source: Any, title: str) -> None:
+        """Sau 8s ghi log: ffmpeg đã ra bao nhiêu byte audio + trạng thái quyền Speak."""
+        await asyncio.sleep(8)
+        try:
+            n = getattr(source, "bytes_read", -1)
+            me = self.vc.guild.me
+            perms = self.vc.channel.permissions_for(me)
+            vs = me.voice
+            logger.warning(
+                "AUDIO DIAG '%s': ffmpeg_bytes=%d (%s) | playing=%s | can_speak=%s | server_mute=%s | suppress=%s",
+                title, n,
+                "OK có dữ liệu" if n > 0 else "0 BYTE → ffmpeg KẸT/không tải được stream",
+                self.vc.is_playing(), perms.speak,
+                getattr(vs, "mute", None), getattr(vs, "suppress", None),
+            )
+            _log_ffmpeg_stderr(source)
+        except Exception as exc:
+            logger.warning("AUDIO DIAG lỗi: %s", exc)
+
     async def _expire_np_message(self, stopped: bool = False) -> None:
         """
         Khi bài kết thúc hoặc stop:
@@ -2320,6 +2362,21 @@ class Music(commands.Cog):
                     "CONNECT | joined #%s [guild %d]%s",
                     channel.name, guild.id, f" (attempt {attempt + 1})" if attempt else "",
                 )
+                _perms = channel.permissions_for(guild.me)
+                if not _perms.speak:
+                    logger.error("THIẾU QUYỀN SPEAK trong #%s — bot sẽ vào được nhưng KHÔNG có tiếng!", channel.name)
+                    try:
+                        await interaction.followup.send(
+                            embed=_e_err(
+                                "Bot thiếu quyền Speak",
+                                f"Bot không có quyền **Speak (Nói)** trong **#{channel.name}** nên sẽ không có tiếng.\n"
+                                "Vào *Edit Channel → Permissions* (hoặc Server Settings → Roles) "
+                                "và bật **Connect + Speak** cho role của bot.",
+                            ),
+                            ephemeral=True,
+                        )
+                    except discord.HTTPException:
+                        pass
                 return voice_client
             except asyncio.TimeoutError:
                 logger.warning(
