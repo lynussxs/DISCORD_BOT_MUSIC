@@ -32,6 +32,7 @@ import base64
 import functools
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -308,9 +309,9 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
         # 2 giá trị này gần như không ảnh hưởng gì tới /play. Giá trị thật sự
         # có tác dụng giảm rate-limit ở đây là sleep_interval_requests (áp
         # dụng cho mọi request kể cả khi chỉ extract metadata).
-        "sleep_interval_requests": 1,
-        "sleep_interval"     : 1,
-        "max_sleep_interval" : 3,
+        "sleep_interval_requests": 0,
+        "sleep_interval"     : 0,
+        "max_sleep_interval" : 0,
         "ratelimit"          : 3_000_000,  # 3MB/s cap — tránh spike bị flag bot
     }
     if use_proxy:
@@ -402,6 +403,13 @@ def _ffmpeg_before(
         if proxy:
             base += f" -http_proxy {proxy}"
     return base
+
+_LAST_GOOD_ATTEMPT: int = 0
+
+def _attempt_order() -> list[int]:
+    """Attempt 0..2 (không proxy) — cái thành công gần nhất lên đầu; attempt 3 (proxy) luôn cuối."""
+    first = _LAST_GOOD_ATTEMPT if _LAST_GOOD_ATTEMPT in (0, 1, 2) else 0
+    return [first] + [a for a in (0, 1, 2) if a != first] + [3]
 
 # Matches http:// and https:// URLs so we can detect non-URL queries.
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -902,6 +910,78 @@ def _log_ffmpeg_stderr(source: Any) -> str:
         return ""
 
 
+# ── Pre-roll buffer ─────────────────────────────────────────────────────────
+# ffmpeg đọc qua proxy lúc đầu hay chậm/jitter → discord.py rút PCM từng frame
+# 20ms, thiếu là giật. Ta cho 1 thread đọc trước PCM vào hàng đợi, và chỉ bắt
+# đầu phát khi đã đệm đủ PREROLL_SECONDS. Hụt giữa chừng thì chèn im lặng thay
+# vì kết thúc bài.
+PREROLL_SECONDS = float(os.getenv("PREROLL_SECONDS", "2"))
+PREROLL_TIMEOUT = float(os.getenv("PREROLL_TIMEOUT", "8"))
+_FRAME_BYTES = 3840  # 20ms, 48kHz, stereo, s16le
+
+
+class _PrebufferedPCM(discord.AudioSource):
+    def __init__(self, inner: discord.AudioSource, max_frames: int = 750) -> None:
+        self._inner = inner
+        self._q: "queue.Queue[bytes]" = queue.Queue(maxsize=max_frames)
+        self._stop = threading.Event()
+        self.eof = False
+        self._err_file = getattr(inner, "_err_file", None)
+        self._t = threading.Thread(target=self._pump, daemon=True, name="pcm-prebuffer")
+        self._t.start()
+
+    def _pump(self) -> None:
+        try:
+            while not self._stop.is_set():
+                data = self._inner.read()
+                if not data:
+                    break
+                while not self._stop.is_set():
+                    try:
+                        self._q.put(data, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception:
+            pass
+        finally:
+            self.eof = True
+
+    @property
+    def buffered_frames(self) -> int:
+        return self._q.qsize()
+
+    def read(self) -> bytes:
+        try:
+            return self._q.get_nowait()
+        except queue.Empty:
+            if self.eof and self._q.empty():
+                return b""
+            return b"\x00" * _FRAME_BYTES  # underrun → im lặng, không cắt bài
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        self._stop.set()
+        try:
+            self._inner.cleanup()
+        except Exception:
+            pass
+
+
+async def _prebuffered(pcm: "discord.FFmpegPCMAudio", volume: float) -> "_CountingSource":
+    buf = _PrebufferedPCM(pcm)
+    target = int(PREROLL_SECONDS * 50)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < PREROLL_TIMEOUT:
+        if buf.buffered_frames >= target or buf.eof:
+            break
+        await asyncio.sleep(0.05)
+    logger.info("Pre-roll: %d frame trong %.1fs", buf.buffered_frames, time.monotonic() - t0)
+    return _CountingSource(buf, volume=volume)
+
+
 class Track:
     """Metadata + streaming URL for one song, resolved by yt-dlp."""
 
@@ -999,7 +1079,7 @@ class Track:
         # Bước 2: Thử không proxy trước → bị chặn thì dùng proxy
         last_err: Exception | None = None
 
-        for attempt in range(4):
+        for attempt in _attempt_order():
             # Bright Data/proxy datacenter thường bị Google tự động gắn cờ bot, và
             # còn gây JITTER khi stream thật (âm thanh giật) — ưu tiên tối đa việc
             # KHÔNG dùng proxy. Chỉ dùng proxy ở lần thử CUỐI CÙNG (attempt 3).
@@ -1063,6 +1143,9 @@ class Track:
                 data: dict[str, Any] = await loop.run_in_executor(None, _extract_sync, opts, video_url)
                 resolved_via_proxy = bool(opts.get("proxy"))
                 resolved_proxy_str = opts.get("proxy")
+                if attempt < 3:
+                    global _LAST_GOOD_ATTEMPT
+                    _LAST_GOOD_ATTEMPT = attempt
                 break
             except Exception as e:
                 last_err = e
@@ -1107,7 +1190,7 @@ class Track:
                     # "Requested format" trên web/ios thường do YouTube khoá SABR-only,
                     # KHÔNG phải rate-limit → chờ lâu hơn cũng không giúp gì, chỉ tốn
                     # thời gian user chờ nhạc phát.
-                    delay = 0.6
+                    delay = 0.2
                     logger.warning(
                         "yt-dlp attempt %d failed (%s), waiting %.1fs (proxy=%s)",
                         attempt + 1, err_str[:80].replace("\n", " "), delay,
@@ -1273,7 +1356,8 @@ class Track:
         # trước khi stream qua proxy — server Piped tự fetch từ YouTube phía
         # họ (không qua proxy của mình) nên thường ổn định hơn với các video
         # cần proxy (geo-lock). Nếu không có kết quả trong 5s, bỏ qua ngay.
-        if self._url_via_proxy and seek == 0 and self.video_id:
+        if (os.getenv("PIPED_BEFORE_PROXY", "0") == "1"
+                and self._url_via_proxy and seek == 0 and self.video_id):
             try:
                 piped_data = await asyncio.wait_for(
                     _piped_fallback(self.video_id, asyncio.get_running_loop()), timeout=5.0,
@@ -1287,7 +1371,7 @@ class Track:
                     _ffmpeg_before(no_proxy=True),
                     opts,
                 )
-                return _CountingSource(pcm, volume=safe_vol)
+                return await _prebuffered(pcm, safe_vol)
 
         pcm = _new_pcm(
             self.url,
@@ -1296,7 +1380,7 @@ class Track:
                            headers=self.http_headers),
             opts,
         )
-        return _CountingSource(pcm, volume=safe_vol)
+        return await _prebuffered(pcm, safe_vol)
 
 
 # ── Embed helpers ──────────────────────────────────────────────────────────────
