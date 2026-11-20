@@ -718,6 +718,29 @@ def _cookies_valid() -> bool:
         return False
 
 
+def _normalize_netscape(text: str) -> bytes:
+    """
+    Chuẩn hoá cookies Netscape dán thẳng vào biến môi trường:
+      • "\\n" dạng chuỗi (khi nền tảng nuốt xuống dòng) → xuống dòng thật;
+      • dòng dữ liệu bị đổi TAB thành khoảng trắng → trả lại TAB (đủ 7 trường);
+      • thiếu dòng tiêu đề "# Netscape HTTP Cookie File" → tự thêm (yt-dlp đòi).
+    """
+    text = text.strip().replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" not in text and "\\n" in text:
+        text = text.replace("\\n", "\n").strip()
+    out: list[str] = []
+    for line in text.split("\n"):
+        line = line.rstrip()
+        if line and "\t" not in line and (not line.startswith("#") or line.startswith("#HttpOnly_")):
+            fields = line.split(None, 6)
+            if len(fields) == 7:
+                line = "\t".join(fields)
+        out.append(line)
+    if not out or not out[0].startswith("# Netscape HTTP Cookie File"):
+        out.insert(0, "# Netscape HTTP Cookie File")
+    return ("\n".join(out) + "\n").encode("utf-8")
+
+
 def _bootstrap_cookiefile() -> None:
     """
     Tự sinh cookies.txt từ biến môi trường lúc khởi động — hữu ích khi deploy
@@ -751,12 +774,29 @@ def _bootstrap_cookiefile() -> None:
         i += 1
 
     b64 = "".join(parts) if parts else os.environ.get("YTDLP_COOKIES_B64", "")
+    plain = os.environ.get("YTDLP_COOKIES", "")
+    if plain.strip() and not b64:
+        # Cách nhanh nhất: dán THẲNG nội dung cookies.txt (Netscape) vào biến
+        # YTDLP_COOKIES trên Railway — không cần mã hoá base64.
+        try:
+            raw = _normalize_netscape(plain)
+            with open(cp, "wb") as f:
+                f.write(raw)
+            logger.info("cookies.txt đã được sinh từ YTDLP_COOKIES (dán thẳng, %d byte).", len(raw))
+            if _cookies_valid():
+                _lock_cookiefile_readonly(cp)
+            else:
+                logger.warning("YTDLP_COOKIES đã ghi nhưng KHÔNG hợp lệ (quá ngắn hoặc thiếu cookie đăng nhập "
+                               "SAPISID/SID/HSID/LOGIN_INFO) — kiểm tra lại đã export đúng định dạng Netscape.")
+        except Exception as exc:
+            logger.warning("Không thể sinh cookies.txt từ YTDLP_COOKIES: %s", exc)
+        return
     if not b64:
         # QUAN TRỌNG: trước đây return im lặng ở đây — không cách nào biết
         # được là do thiếu biến môi trường hay do lỗi khác. Giờ log rõ ràng
         # để không còn debug mù nữa.
         logger.warning(
-            "Không tìm thấy YTDLP_COOKIES_B64 hoặc YTDLP_COOKIES_B64_1 nào trong "
+            "Không tìm thấy YTDLP_COOKIES, YTDLP_COOKIES_B64 hay YTDLP_COOKIES_B64_1 nào trong "
             "biến môi trường — cookies.txt sẽ KHÔNG được tự sinh. Kiểm tra lại "
             "tên biến đã set trên Railway (Variables tab) có đúng chính xác "
             "'YTDLP_COOKIES_B64_1', '_2', '_3'... không (phân biệt hoa/thường, "
