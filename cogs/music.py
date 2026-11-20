@@ -201,13 +201,20 @@ class WebshareProxyManager:
                     timeout=10,
                 )
                 if r.status_code == 200:
+                    fresh: list[str] = []
                     for p in r.json().get("results", []):
                         country = p.get("country_code", "US").upper()
                         if country not in self.ALLOWED_COUNTRIES:
                             continue
                         url = f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
-                        if url not in self._proxies:
-                            self._proxies.append(url)
+                        if url not in fresh:
+                            fresh.append(url)
+                    if fresh:
+                        # API trả credentials HIỆN TẠI → xếp lên ĐẦU, trước danh sách WEBSHARE_10
+                        # ghi cứng (có thể đã cũ: log 11:38 có proxy báo 407 dù API vẫn trả 200).
+                        keep = [u for u in self._proxies if u not in fresh]
+                        self._proxies = fresh + keep
+                        logger.info("Webshare API: %d proxy mới nhất được xếp lên đầu danh sách.", len(fresh))
             except Exception:
                 pass
             finally:
@@ -966,11 +973,18 @@ _YT_STRATEGIES: list[dict[str, Any]] = [
     # là nhóm duy nhất không đòi PO Token — thử riêng để không "giành format" với nhau.
     {"name": "embed_vr", "clients": ["web_embedded", "android_vr"],        "cookies": False, "proxy": False},
     {"name": "web",      "clients": ["web", "mweb"],                       "cookies": True,  "proxy": False},
+    # Có cookies thì dùng thêm 2 client "sống được" với tài khoản đăng nhập: web_safari
+    # (HLS không đòi PO Token) và tv (cần cookies/guest session, nếu không bị DRM/bot-check).
+    # Log 11:38: 'web' trả "Requested format is not available" cho 1 video (YouTube chỉ
+    # đưa SABR cho web) trong khi tv/embed_vr — chạy KHÔNG cookies — dính bot-check.
+    {"name": "safari_ck", "clients": ["web_safari"],                       "cookies": True,  "proxy": False},
+    {"name": "tv_ck",    "clients": ["tv"],                                "cookies": True,  "proxy": False},
     {"name": "ios",      "clients": ["ios"],                               "cookies": False, "proxy": False},
     {"name": "proxy",    "clients": ["tv_embedded", "tv", "android", "android_vr"], "cookies": False, "proxy": True},
 ]
 
 _RESOLVE_ATTEMPT_TIMEOUT = 20.0   # tối đa cho 1 lần extract — tránh 1 attempt treo ăn hết thời gian
+_RESOLVE_TOTAL_BUDGET    = 35.0   # tổng thời gian tối đa cho mọi chiến lược của 1 bài
 _RESOLVE_CACHE_TTL       = 300.0
 _RESOLVE_CACHE_MAX       = 64
 
@@ -1062,8 +1076,12 @@ async def _resolve_stream(
     vid = vm.group(1) if vm else video_url
     plan = _breaker.plan()
     last_err: Exception | None = None
+    t_start = time.monotonic()
 
     for i, strat in enumerate(plan):
+        if i and time.monotonic() - t_start > _RESOLVE_TOTAL_BUDGET:
+            logger.warning("RESOLVE | quá %.0fs, dừng thử thêm chiến lược", _RESOLVE_TOTAL_BUDGET)
+            break
         opts = _ytdl_opts(strat["cookies"], use_proxy=strat["proxy"])
         opts["extractor_args"]["youtube"] = {
             "player_client": strat["clients"],
