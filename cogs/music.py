@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import functools
 import json
 import os
@@ -308,7 +309,7 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
         # 2 giá trị này gần như không ảnh hưởng gì tới /play. Giá trị thật sự
         # có tác dụng giảm rate-limit ở đây là sleep_interval_requests (áp
         # dụng cho mọi request kể cả khi chỉ extract metadata).
-        "sleep_interval_requests": 1,
+        "sleep_interval_requests": 0,  # 0 (trước là 1): mỗi lần extract gồm vài request, mỗi cái ngủ thêm 1s → mất 3-5s/attempt vô ích; bot chỉ resolve 1 video mỗi lệnh nên không gây rate-limit
         "sleep_interval"     : 1,
         "max_sleep_interval" : 3,
         "ratelimit"          : 3_000_000,  # 3MB/s cap — tránh spike bị flag bot
@@ -851,6 +852,14 @@ class _CountingSource(discord.PCMVolumeTransformer):
         self.peak = 0                      # biên độ lớn nhất (0..32767) — =0 nghĩa là toàn im lặng
         self.first_byte_at: float | None = None
 
+    @property
+    def underruns(self) -> int:
+        return getattr(self.original, "underruns", 0)
+
+    @property
+    def buffered_s(self) -> float:
+        return getattr(self.original, "buffered_s", 0.0)
+
     def read(self) -> bytes:
         data = super().read()
         if data:
@@ -900,6 +909,256 @@ def _log_ffmpeg_stderr(source: Any) -> str:
         return tail
     except Exception:
         return ""
+
+
+# ── Resolve: chiến lược lấy stream, circuit breaker, cache ─────────────────────
+#
+# Log thực tế cho thấy 3 chiến lược "direct" (không proxy) gần như LUÔN fail trên
+# server (Railway = IP datacenter), mỗi lần tốn ~5s, rồi chiến lược proxy mới
+# thành công → 15-20s từ lúc /play tới lúc có tiếng. Breaker ghi nhớ chiến lược
+# nào đang chết (≥3 video KHÁC NHAU liên tiếp fail) và bỏ qua nó 10 phút, nên các
+# bài sau đi thẳng vào chiến lược đang sống. Sau 10 phút nó thử lại 1 lần
+# (half-open); fail tiếp là khoá lại ngay.
+
+_YT_STRATEGIES: list[dict[str, Any]] = [
+    {"name": "tv",       "clients": ["tv_embedded", "tv"],                 "cookies": False, "proxy": False},
+    # web_embedded + android_vr: theo PO Token Guide của yt-dlp, 2 client này (cùng "tv")
+    # là nhóm duy nhất không đòi PO Token — thử riêng để không "giành format" với nhau.
+    {"name": "embed_vr", "clients": ["web_embedded", "android_vr"],        "cookies": False, "proxy": False},
+    {"name": "web",      "clients": ["web", "mweb"],                       "cookies": True,  "proxy": False},
+    {"name": "ios",      "clients": ["ios"],                               "cookies": False, "proxy": False},
+    {"name": "proxy",    "clients": ["tv_embedded", "tv", "android", "android_vr"], "cookies": False, "proxy": True},
+]
+
+_RESOLVE_ATTEMPT_TIMEOUT = 20.0   # tối đa cho 1 lần extract — tránh 1 attempt treo ăn hết thời gian
+_RESOLVE_CACHE_TTL       = 300.0
+_RESOLVE_CACHE_MAX       = 64
+
+
+class _StrategyBreaker:
+    TRIP_AFTER = 3
+    COOLDOWN   = 600.0
+
+    def __init__(self) -> None:
+        self._fails: dict[str, int]   = {}
+        self._last_vid: dict[str, str] = {}
+        self._until: dict[str, float] = {}
+        self._ok_at: dict[str, float] = {}
+
+    def ok(self, name: str) -> None:
+        self._fails[name] = 0
+        self._until.pop(name, None)
+        self._ok_at[name] = time.monotonic()
+
+    def fail(self, name: str, video_id: str) -> None:
+        # Cùng 1 video fail nhiều lần (DRM, giới hạn tuổi...) không phải lỗi của
+        # chiến lược → chỉ đếm khi là video KHÁC với lần fail trước.
+        if self._last_vid.get(name) == video_id:
+            return
+        self._last_vid[name] = video_id
+        n = self._fails.get(name, 0) + 1
+        self._fails[name] = n
+        if n >= self.TRIP_AFTER:
+            self._until[name] = time.monotonic() + self.COOLDOWN
+            logger.warning("BREAKER | chiến lược '%s' fail %d video liên tiếp → bỏ qua %.0f phút",
+                           name, n, self.COOLDOWN / 60)
+
+    def tripped(self, name: str) -> bool:
+        return self._until.get(name, 0.0) > time.monotonic()
+
+    def direct_dead(self) -> bool:
+        directs = [s["name"] for s in _YT_STRATEGIES if not s["proxy"]]
+        return bool(directs) and all(self.tripped(n) for n in directs)
+
+    def plan(self) -> list[dict[str, Any]]:
+        directs = [s for s in _YT_STRATEGIES if not s["proxy"]]
+        proxies = [s for s in _YT_STRATEGIES if s["proxy"]]
+        alive = [s for s in directs if not self.tripped(s["name"])]
+        dead  = [s for s in directs if self.tripped(s["name"])]
+        alive.sort(key=lambda s: -self._ok_at.get(s["name"], 0.0))  # sort ổn định: thắng gần nhất lên trước
+        # Chiến lược proxy thử 2 lần (lần fail đầu mark_dead proxy đó → lần 2 dùng proxy khác).
+        return alive + proxies * 2 + dead
+
+
+_breaker = _StrategyBreaker()
+_resolve_cache: dict[str, tuple[float, dict[str, Any], bool, str | None]] = {}
+_search_cache: dict[str, tuple[float, str]] = {}
+
+
+def _resolve_cache_get(video_url: str) -> tuple[dict[str, Any], bool, str | None] | None:
+    hit = _resolve_cache.get(video_url)
+    if hit and (time.monotonic() - hit[0]) < _RESOLVE_CACHE_TTL:
+        return hit[1], hit[2], hit[3]
+    _resolve_cache.pop(video_url, None)
+    return None
+
+
+def _resolve_cache_put(video_url: str, data: dict[str, Any], via_proxy: bool, proxy: str | None) -> None:
+    if len(_resolve_cache) >= _RESOLVE_CACHE_MAX:
+        _resolve_cache.pop(min(_resolve_cache, key=lambda k: _resolve_cache[k][0]), None)
+    _resolve_cache[video_url] = (time.monotonic(), data, via_proxy, proxy)
+
+
+_UNAVAILABLE_MARKERS = (
+    "video is unavailable", "video unavailable", "this video is private",
+    "video has been removed", "account associated with this video",
+    "private video", "video is no longer available",
+)
+
+
+async def _resolve_stream(
+    video_url: str, loop: asyncio.AbstractEventLoop,
+) -> tuple[dict[str, Any] | None, str | None, Exception | None]:
+    """
+    Thử lần lượt các chiến lược theo _breaker.plan().
+    Trả về (data, proxy_đã_dùng, None) nếu thành công, (None, None, last_err) nếu hết cách.
+    Raise ngay nếu video THẬT SỰ không tồn tại/private.
+    """
+    vm = re.search(r"(?:v=|/)([\w-]{11})(?:[&?/]|$)", video_url)
+    vid = vm.group(1) if vm else video_url
+    plan = _breaker.plan()
+    last_err: Exception | None = None
+
+    for i, strat in enumerate(plan):
+        opts = _ytdl_opts(strat["cookies"], use_proxy=strat["proxy"])
+        opts["extractor_args"]["youtube"] = {
+            "player_client": strat["clients"],
+            "skip": ["translated_subs", "comments"],
+        }
+        logger.info("Client rotation | attempt %d/%d [%s] → %s (proxy=%s)", i + 1, len(plan),
+                    strat["name"], strat["clients"], "yes" if opts.get("proxy") else "no")
+        t0 = time.monotonic()
+        try:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, _extract_sync, opts, video_url),
+                timeout=_RESOLVE_ATTEMPT_TIMEOUT,
+            )
+            _breaker.ok(strat["name"])
+            logger.info("RESOLVE OK | [%s] %.1fs", strat["name"], time.monotonic() - t0)
+            return data, opts.get("proxy"), None
+        except asyncio.TimeoutError:
+            last_err = RuntimeError(f"yt-dlp timeout sau {_RESOLVE_ATTEMPT_TIMEOUT:.0f}s ({strat['name']})")
+            err_str = str(last_err)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            err_str = str(e)
+            # Không bắt nhầm "Requested format is not available" (lỗi format, retry được).
+            # So khớp KHÔNG phân biệt hoa/thường: yt-dlp báo "Video unavailable" (V hoa) nên
+            # bản cũ so sánh trực tiếp với chuỗi thường không bao giờ khớp → video chết thật
+            # vẫn bị thử hết mọi chiến lược trước khi báo lỗi.
+            _low = err_str.lower()
+            if any(x in _low for x in _UNAVAILABLE_MARKERS) and "format" not in _low:
+                raise
+
+        _breaker.fail(strat["name"], vid)
+        current = opts.get("proxy", "")
+        if current:
+            if "407" in err_str or "Proxy Authentication" in err_str:
+                _proxy.mark_dead(current, temporary=False)
+                if current == _proxy.PROXY_US:
+                    logger.warning("PROXY_US bị 407 — credentials sai/hết hạn! Cần update Secrets.")
+            else:
+                _proxy.mark_dead(current, temporary=True)
+        logger.warning("yt-dlp attempt %d [%s] failed (%s) %.1fs (proxy=%s)", i + 1, strat["name"],
+                       err_str[:80].replace("\n", " "), time.monotonic() - t0,
+                       current[-15:] if current else "none")
+        if i < len(plan) - 1:
+            await asyncio.sleep(0.3)
+
+    return None, None, last_err
+
+
+class _BufferedPCM(discord.AudioSource):
+    """
+    Bộ đệm PCM: 1 thread nền đọc ffmpeg liên tục vào hàng đợi, player của discord.py
+    chỉ lấy từ hàng đợi.
+
+    Vì sao: ffmpeg mở stream qua proxy mất vài giây rồi đầu bài đọc chậm hơn thời
+    gian thực → player đói frame → nghe giật ở đầu bài, sau đó ổn. Ở đây ta CHỜ có
+    sẵn ~2-3s đệm rồi mới phát, và nếu giữa bài đệm cạn thì phát im lặng cho tới
+    khi đệm lại ≥0.5s (rebuffer) thay vì giật từng frame.
+    """
+    FRAME = 3840          # 20ms @ 48kHz s16le stereo
+    FPS   = 50
+
+    def __init__(self, inner: "discord.FFmpegPCMAudio", target_s: float = 2.0,
+                 max_s: float = 12.0, rebuffer_s: float = 0.5) -> None:
+        self._inner = inner
+        self._frames: collections.deque[bytes] = collections.deque()
+        self._cond = threading.Condition()
+        self._target = int(target_s * self.FPS)
+        self._max    = int(max_s * self.FPS)
+        self._rebuf  = max(1, int(rebuffer_s * self.FPS))
+        self._eof = False
+        self._stopped = False
+        self._rebuffering = False
+        self._silence = b"\x00" * self.FRAME
+        self.underruns = 0
+        self._err_file = getattr(inner, "_err_file", None)  # để _log_ffmpeg_stderr vẫn đọc được
+        threading.Thread(target=self._pump, daemon=True, name="pcm-prebuffer").start()
+
+    def _pump(self) -> None:
+        try:
+            while True:
+                with self._cond:
+                    while len(self._frames) >= self._max and not self._stopped:
+                        self._cond.wait(0.5)
+                    if self._stopped:
+                        return
+                data = self._inner.read()
+                with self._cond:
+                    if not data:
+                        self._eof = True
+                        self._cond.notify_all()
+                        return
+                    self._frames.append(data)
+                    self._cond.notify_all()
+        except Exception:  # ffmpeg bị kill/cleanup giữa chừng → coi như hết stream
+            with self._cond:
+                self._eof = True
+                self._cond.notify_all()
+
+    @property
+    def buffered_s(self) -> float:
+        return len(self._frames) / self.FPS
+
+    async def wait_ready(self, timeout: float) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with self._cond:
+                if len(self._frames) >= self._target or self._eof:
+                    return True
+            await asyncio.sleep(0.05)
+        return False
+
+    def read(self) -> bytes:
+        with self._cond:
+            n = len(self._frames)
+            if self._rebuffering and (n >= self._rebuf or self._eof):
+                self._rebuffering = False
+            if not self._rebuffering and n:
+                data = self._frames.popleft()
+                self._cond.notify_all()
+                return data
+            if n == 0 and self._eof:
+                return b""
+            if not self._rebuffering:
+                self._rebuffering = True
+                self.underruns += 1
+            return self._silence
+
+    def cleanup(self) -> None:
+        with self._cond:
+            self._stopped = True
+            self._cond.notify_all()
+        try:
+            self._inner.cleanup()
+        except Exception:
+            pass
+
+
+_PREBUFFER_TIMEOUT = 12.0
+PIPED_FIRST = os.environ.get("PIPED_FIRST", "0") == "1"
 
 
 class Track:
@@ -971,156 +1230,52 @@ class Track:
             # thử lại chính bằng "ytsearch1:<query>" trong vòng client rotation
             # phía dưới luôn, để vẫn có cơ hội qua được nhờ PO-Token/client tốt.
             resolved = query if _URL_RE.match(query) else f"ytsearch1:{query}"
-            try:
-                search_opts = {
-                    "default_search" : "ytsearch",
-                    "noplaylist"     : False,
-                    "quiet"          : True,
-                    "no_warnings"    : True,
-                    "extract_flat"   : True,
-                    "socket_timeout" : 8,
-                }
-                with yt_dlp.YoutubeDL(search_opts) as ytdl:
-                    partial = functools.partial(ytdl.extract_info, resolved, download=False)
-                    search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
-                if "entries" in search_data:
-                    entries = [e for e in search_data["entries"] if e]
-                    if not entries:
-                        raise ValueError(f"No results found for: {query}")
-                    entry = entries[0]
-                    video_url = (entry.get("url") or entry.get("webpage_url")
-                                 or f"https://www.youtube.com/watch?v={entry['id']}")
-                else:
-                    video_url = resolved
-            except Exception as _search_exc:
-                logger.warning("Bước search sơ bộ lỗi (%s) — thử lại trực tiếp qua client rotation", _search_exc)
-                video_url = resolved  # để vòng client rotation tự xử lý (kể cả dạng ytsearch1:)
+            _sc = _search_cache.get(resolved)
+            if _sc and (time.monotonic() - _sc[0]) < 600:
+                video_url = _sc[1]   # đã tìm query này gần đây → khỏi gọi search lần nữa
+            else:
+                try:
+                    search_opts = {
+                        "default_search" : "ytsearch",
+                        "noplaylist"     : False,
+                        "quiet"          : True,
+                        "no_warnings"    : True,
+                        "extract_flat"   : True,
+                        "socket_timeout" : 8,
+                    }
+                    with yt_dlp.YoutubeDL(search_opts) as ytdl:
+                        partial = functools.partial(ytdl.extract_info, resolved, download=False)
+                        search_data: dict[str, Any] = await loop.run_in_executor(None, partial)
+                    if "entries" in search_data:
+                        entries = [e for e in search_data["entries"] if e]
+                        if not entries:
+                            raise ValueError(f"No results found for: {query}")
+                        entry = entries[0]
+                        video_url = (entry.get("url") or entry.get("webpage_url")
+                                     or f"https://www.youtube.com/watch?v={entry['id']}")
+                    else:
+                        video_url = resolved
+                    if resolved.startswith("ytsearch1:"):
+                        if len(_search_cache) > 128:
+                            _search_cache.clear()
+                        _search_cache[resolved] = (time.monotonic(), video_url)
+                except Exception as _search_exc:
+                    logger.warning("Bước search sơ bộ lỗi (%s) — thử lại trực tiếp qua client rotation", _search_exc)
+                    video_url = resolved  # để vòng client rotation tự xử lý (kể cả dạng ytsearch1:)
 
-        # Bước 2: Thử không proxy trước → bị chặn thì dùng proxy
-        last_err: Exception | None = None
+        # Bước 2: resolve stream URL. Cache ngắn hạn → /play lại cùng bài gần như
+        # tức thì; còn lại đi qua _resolve_stream() (breaker + thứ tự chiến lược).
+        cached = _resolve_cache_get(video_url)
+        if cached is not None:
+            c_data, c_via_proxy, c_proxy = cached
+            logger.info("RESOLVE CACHE HIT | '%s'", c_data.get("title", "?"))
+            return cls(c_data, requester, via_proxy=c_via_proxy, proxy_used=c_proxy)
 
-        for attempt in range(4):
-            # Bright Data/proxy datacenter thường bị Google tự động gắn cờ bot, và
-            # còn gây JITTER khi stream thật (âm thanh giật) — ưu tiên tối đa việc
-            # KHÔNG dùng proxy. Chỉ dùng proxy ở lần thử CUỐI CÙNG (attempt 3).
-            #
-            # THỨ TỰ CLIENT (đã đảo lại dựa trên thực tế quan sát được):
-            #   attempt 0: android/tv_embedded/android_vr, KHÔNG proxy — đây là
-            #     tổ hợp DUY NHẤT luôn thành công trong thực tế (chưa từng thử
-            #     không proxy trước đây, luôn ép proxy oan uổng). tv_embedded/
-            #     android_vr được YouTube thiết kế bypass-auth nên vẫn còn trả
-            #     URL stream trực tiếp, không bị khoá SABR-only như web/ios.
-            #   attempt 1: web + cookies + PO-Token, KHÔNG proxy — vẫn giữ thử
-            #     (đề phòng 1 số video legacy chưa bị SABR khoá), nhưng KHÔNG
-            #     còn ưu tiên vì thực tế gần như luôn "Requested format is not
-            #     available" — đây là do YouTube đã chuyển web/ios sang
-            #     SABR-only streaming (không lộ URL trực tiếp nữa), KHÔNG phải
-            #     lỗi cookie/PO-Token — không có cách nào fix từ phía yt-dlp.
-            #   attempt 2: ios, KHÔNG proxy — tương tự, giữ làm phương án phụ.
-            #   attempt 3: android/tv_embedded/android_vr/tv, CÓ proxy — chỉ
-            #     khi cả 3 lần trước đều fail (hiếm, có thể do IP server bị chặn).
-            use_proxy = (attempt == 3)
+        data, resolved_proxy_str, last_err = await _resolve_stream(video_url, loop)
+        resolved_via_proxy = bool(resolved_proxy_str)
 
-            if attempt == 0:
-                # ĐỔI THỨ TỰ (17/08/2026): tv_embedded/tv lên ĐẦU, android/
-                # android_vr bị đẩy xuống attempt cuối. Lý do: android/
-                # android_vr giờ yêu cầu GVS PO-Token cho MỌI itag TRỪ 18 —
-                # itag 251 (audio-only, cái bot luôn chọn) LUÔN cần token,
-                # trong khi tv_embedded trả về định dạng HLS (m3u8) mà theo
-                # tài liệu yt-dlp hiện tại CHƯA cần PO-Token. Quan trọng hơn:
-                # trước đây gộp chung android_vr + tv_embedded trong CÙNG 1
-                # lần extract khiến yt-dlp merge format rồi ưu tiên chọn
-                # format của android_vr (bitrate cao hơn) thay vì HLS của
-                # tv_embedded — dù tv_embedded có mặt cũng vô nghĩa. Giờ tách
-                # hẳn ra 1 attempt riêng, không còn ai "giành" format nữa.
-                opts = _ytdl_opts(False, use_proxy=use_proxy)
-                opts["extractor_args"]["youtube"] = {"player_client": ["tv_embedded", "tv"],
-                                                       "skip": ["translated_subs", "comments"]}
-            elif attempt == 1:
-                # web + cookies + PO-Token — combo đúng nếu video chưa bị SABR khoá.
-                # Thêm "mweb" (mobile web) — LƯU Ý: mweb từng KHÔNG cần PO-Token
-                # nhưng yt-dlp đã đổi default sang "tv" vì mweb giờ cũng hay cần
-                # PO-Token rồi (không còn bền như trước) — vẫn giữ làm phương án
-                # phụ, không kỳ vọng nhiều.
-                opts = _ytdl_opts(True, use_proxy=use_proxy)
-                opts["extractor_args"]["youtube"] = {"player_client": ["web", "mweb"],
-                                                       "skip": ["translated_subs", "comments"]}
-            elif attempt == 2:
-                # ios KHÔNG dùng cookies — nếu không yt-dlp sẽ tự skip client này
-                opts = _ytdl_opts(False, use_proxy=use_proxy)
-                opts["extractor_args"]["youtube"] = {"player_client": ["ios"],
-                                                       "skip": ["translated_subs", "comments"]}
-            else:  # attempt 3 — phương án cuối, CÓ proxy — gộp lại full combo kể
-                   # cả android/android_vr (đôi khi vẫn hoạt động, không loại hẳn)
-                opts = _ytdl_opts(False, use_proxy=use_proxy)
-                opts["extractor_args"]["youtube"] = {"player_client": ["tv_embedded", "tv", "android", "android_vr"],
-                                                       "skip": ["translated_subs", "comments"]}
-            logger.info("Client rotation | attempt %d → %s (proxy=%s)", attempt + 1,
-                        opts["extractor_args"]["youtube"]["player_client"],
-                        "yes" if use_proxy else "no")
-
-            try:
-                data: dict[str, Any] = await loop.run_in_executor(None, _extract_sync, opts, video_url)
-                resolved_via_proxy = bool(opts.get("proxy"))
-                resolved_proxy_str = opts.get("proxy")
-                break
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-
-                # Chỉ raise ngay nếu video THẬT SỰ không tồn tại/private — không bắt nhầm
-                # "Requested format is not available" (lỗi format, có thể retry được).
-                is_truly_unavailable = any(x in err_str for x in [
-                    "video is unavailable", "video unavailable", "this video is private",
-                    "video has been removed", "account associated with this video",
-                    "private video", "video is no longer available",
-                ]) and "format" not in err_str.lower()
-                if is_truly_unavailable:
-                    raise last_err
-
-                # QUAN TRỌNG (18/08/2026): ĐẢO NGƯỢC logic — trước đây dùng
-                # allowlist (chỉ retry nếu lỗi khớp 1 trong vài câu quen thuộc:
-                # "Requested format", "403", "Sign in to confirm"...). Cách này
-                # LUÔN đuổi theo sau, vì YouTube liên tục đổi câu thông báo mới
-                # ("DRM protected", "The page needs to be reloaded.", và chắc
-                # chắn còn nhiều câu khác nữa trong tương lai) — mỗi câu lạ
-                # không nằm trong allowlist khiến bot bỏ cuộc oan sau ĐÚNG 1
-                # lần thử (tv_embedded/tv), chưa từng thử qua android/ios/web dù
-                # 3 client đó có thể phát bình thường cho ĐÚNG video đó. Giờ mặc
-                # định LUÔN retry hết cả 4 attempt — chỉ dừng sớm ở nhánh
-                # is_truly_unavailable phía trên (video removed/private thật).
-                is_407 = "407" in err_str or "Proxy Authentication" in err_str
-
-                if attempt < 3:
-                    current = opts.get("proxy", "")
-                    # 407 = proxy auth fail → mark dead permanent
-                    if is_407:
-                        if current:
-                            _proxy.mark_dead(current, temporary=False)
-                            # Nếu proxy US bị 407 (auth fail) → đừng force lại nó
-                            if current == _proxy.PROXY_US:
-                                logger.warning("PROXY_US bị 407 — credentials sai/hết hạn! Cần update Secrets.")
-                    elif current:
-                        _proxy.mark_dead(current, temporary=True)
-
-                    # Backoff ngắn (1.5s cố định) — KHÔNG dùng exponential nữa vì lỗi
-                    # "Requested format" trên web/ios thường do YouTube khoá SABR-only,
-                    # KHÔNG phải rate-limit → chờ lâu hơn cũng không giúp gì, chỉ tốn
-                    # thời gian user chờ nhạc phát.
-                    delay = 0.6
-                    logger.warning(
-                        "yt-dlp attempt %d failed (%s), waiting %.1fs (proxy=%s)",
-                        attempt + 1, err_str[:80].replace("\n", " "), delay,
-                        current[-15:] if current else "none",
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                # Hết attempt cuối cùng mà vẫn fail → KHÔNG raise ngay ở đây,
-                # để code phía dưới có cơ hội thử Piped fallback trước khi bỏ cuộc.
-                break
-
-        if last_err is not None and 'data' not in dir():
-            # ── Mọi client/proxy/AI đều fail → thử Piped API làm phương án cuối ──
+        if data is None:
+            # ── Mọi client/proxy đều fail → thử Piped API làm phương án cuối ──
             vid_match = re.search(r"(?:v=|/)([\w-]{11})(?:[&?/]|$)", video_url)
             if vid_match:
                 logger.warning("yt-dlp exhausted, trying Piped fallback for %s…", vid_match.group(1))
@@ -1128,14 +1283,7 @@ class Track:
                 if piped_data:
                     # Piped/Invidious tự phục vụ URL của họ, không qua proxy Bright Data/Webshare
                     return cls(piped_data, requester, via_proxy=False)
-
-            err_str = str(last_err)
-            # LƯU Ý: đã bỏ nhánh "Bot-check thất bại vĩnh viễn" từng có ở đây —
-            # nó suy luận sai. Lỗi cuối cùng luôn tới từ attempt cuối (proxy),
-            # và attempt đó theo THIẾT KẾ không bao giờ gửi cookie (bất kể
-            # cookies.txt tốt hay xấu) — nên "Sign in to confirm" ở bước này
-            # không phản ánh đúng tình trạng cookie thật. Cứ để lỗi gốc của
-            # yt-dlp hiện ra, chính xác hơn là tự đoán nhầm nguyên nhân.
+            # Để lỗi gốc của yt-dlp hiện ra (chính xác hơn việc tự đoán nguyên nhân).
             raise last_err  # type: ignore
 
         # ── Nếu URL có gcr=<country> → re-fetch qua proxy để tránh 403 khi stream ──
@@ -1173,8 +1321,9 @@ class Track:
             except Exception as _e:
                 logger.warning("gcr=%s proxy re-fetch failed: %s — will retry on stream drop", gcr_country, _e)
 
-        return cls(data, requester, via_proxy=resolved_via_proxy,  # type: ignore[possibly-undefined]
-                   proxy_used=resolved_proxy_str)  # type: ignore[possibly-undefined]
+        _resolve_cache_put(video_url, data, resolved_via_proxy, resolved_proxy_str)
+        return cls(data, requester, via_proxy=resolved_via_proxy,
+                   proxy_used=resolved_proxy_str)
 
     @property
     def duration_str(self) -> str:
@@ -1207,7 +1356,12 @@ class Track:
             return
         last_exc: Exception | None = None
         # force_proxy=True → chỉ thử proxy (skip direct hoàn toàn)
-        proxy_order = (True,) if force_proxy else (False, True)
+        if force_proxy:
+            proxy_order = (True,)
+        elif self._url_via_proxy and _breaker.direct_dead():
+            proxy_order = (True, False)   # direct đang bị breaker khoá → khỏi tốn 1 lượt fail
+        else:
+            proxy_order = (False, True)
         for use_proxy in proxy_order:
             try:
                 # QUAN TRỌNG: ép dùng client tv_embedded/tv trước (HLS, chưa cần
@@ -1273,7 +1427,12 @@ class Track:
         # trước khi stream qua proxy — server Piped tự fetch từ YouTube phía
         # họ (không qua proxy của mình) nên thường ổn định hơn với các video
         # cần proxy (geo-lock). Nếu không có kết quả trong 5s, bỏ qua ngay.
-        if self._url_via_proxy and seek == 0 and self.video_id:
+        #
+        # MẶC ĐỊNH TẮT (PIPED_FIRST=1 để bật lại): log thực tế không có lần nào
+        # "Dùng Piped stream" — nghĩa là mỗi bài qua proxy đều NGỒI CHỜ trọn 5s
+        # timeout rồi mới khởi động ffmpeg, cộng thẳng vào độ trễ đầu bài. Piped
+        # vẫn còn là phương án cuối trong from_query() khi yt-dlp fail hoàn toàn.
+        if PIPED_FIRST and self._url_via_proxy and seek == 0 and self.video_id:
             try:
                 piped_data = await asyncio.wait_for(
                     _piped_fallback(self.video_id, asyncio.get_running_loop()), timeout=5.0,
@@ -1287,7 +1446,7 @@ class Track:
                     _ffmpeg_before(no_proxy=True),
                     opts,
                 )
-                return _CountingSource(pcm, volume=safe_vol)
+                return await self._wrap_source(pcm, safe_vol, via_proxy=False)
 
         pcm = _new_pcm(
             self.url,
@@ -1296,7 +1455,27 @@ class Track:
                            headers=self.http_headers),
             opts,
         )
-        return _CountingSource(pcm, volume=safe_vol)
+        return await self._wrap_source(pcm, safe_vol, via_proxy=self._url_via_proxy)
+
+    async def _wrap_source(self, pcm: "discord.FFmpegPCMAudio", volume: float,
+                           via_proxy: bool) -> "_CountingSource":
+        """
+        Bọc PCM trong bộ đệm rồi CHỜ có sẵn ~2s (3s nếu qua proxy) trước khi trả
+        về cho player — để đầu bài không bị giật khi ffmpeg khởi động chậm.
+        Volume vẫn live vì _CountingSource (PCMVolumeTransformer) nằm trên bộ đệm.
+        """
+        buf = _BufferedPCM(pcm, target_s=3.0 if via_proxy else 2.0)
+        src = _CountingSource(buf, volume=volume)
+        t0 = time.monotonic()
+        try:
+            ready = await buf.wait_ready(_PREBUFFER_TIMEOUT)
+        except BaseException:      # bị cancel (/stop) trong lúc đợi → dọn ffmpeg, không để rò process
+            src.cleanup()
+            raise
+        logger.info("PREBUFFER | '%s' %s sau %.1fs (đệm=%.1fs, proxy=%s)", self.title,
+                    "sẵn sàng" if ready else "HẾT GIỜ CHỜ — phát luôn", time.monotonic() - t0,
+                    buf.buffered_s, "yes" if via_proxy else "no")
+        return src
 
 
 # ── Embed helpers ──────────────────────────────────────────────────────────────
@@ -1928,6 +2107,10 @@ class GuildPlayer:
                 try:
                     source = await track.make_source(self.volume)
                     self._current_source = source  # cho set_volume() chỉnh live
+                    # make_source() có thể mất vài giây (chờ prebuffer) → tính giờ bài
+                    # từ lúc THỰC SỰ bắt đầu phát, nếu không progress bar chạy lố.
+                    self._start = time.monotonic()
+                    self._attempt_start = time.monotonic()
                 except Exception as exc:
                     logger.error(
                         "SOURCE | failed for '%s': %s [guild %d]",
@@ -2233,8 +2416,9 @@ class GuildPlayer:
                 perms = self.vc.channel.permissions_for(me)
                 vs = me.voice
                 logger.warning(
-                    "AUDIO DIAG '%s': ffmpeg_bytes=%d peak=%s | playing=%s | can_speak=%s mute=%s suppress=%s | %s",
-                    title, n, getattr(source, "peak", "?"), self.vc.is_playing(),
+                    "AUDIO DIAG '%s': ffmpeg_bytes=%d peak=%s underruns=%s buf=%.1fs | playing=%s | can_speak=%s mute=%s suppress=%s | %s",
+                    title, n, getattr(source, "peak", "?"), getattr(source, "underruns", "?"),
+                    getattr(source, "buffered_s", 0.0), self.vc.is_playing(),
                     perms.speak, getattr(vs, "mute", None), getattr(vs, "suppress", None),
                     _dave_state(self.vc),
                 )

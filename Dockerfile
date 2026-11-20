@@ -31,5 +31,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy toàn bộ code sau cùng
 COPY . .
 
+# Luôn lấy yt-dlp MỚI NHẤT ở mỗi lần build. Layer `pip install -r requirements.txt`
+# ở trên được cache miễn requirements.txt không đổi → Railway có thể giữ mãi 1 bản
+# yt-dlp cũ dù requirements ghi ">=". Đặt SAU `COPY . .` nên chạy lại mỗi lần
+# đổi code; YouTube đổi cách trả stream gần như hàng tuần và yt-dlp vá theo.
+RUN pip install --no-cache-dir -U "yt-dlp[default]"
+
 # Không set ENV nào chứa secret ở đây — Railway tự inject lúc container start
 CMD ["python3", "bot.py"]

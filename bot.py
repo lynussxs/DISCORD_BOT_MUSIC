@@ -391,6 +391,13 @@ class MusicBot(commands.Bot):
         logger.info("  ✅  Bot online: %s (ID: %d)", self.user, self.user.id)  # type: ignore[union-attr]
         logger.info("  📡  Guilds    : %d", len(self.guilds))
         logger.info("  🏓  Latency   : %.1f ms", self.latency * 1000)
+        try:
+            import yt_dlp
+            # Ghi version để biết Railway có đang chạy bản yt-dlp mới không (Docker layer
+            # cache có thể giữ bản cũ → vẫn dính lỗi đã được vá, vd "page needs to be reloaded").
+            logger.info("  📦  yt-dlp    : %s", yt_dlp.version.__version__)
+        except Exception:
+            pass
         logger.info(
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
