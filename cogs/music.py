@@ -532,6 +532,23 @@ async def _get_invidious_instances(client: "Any") -> list[str]:
     return _INVIDIOUS_FALLBACK_HARDCODED
 
 
+async def _stream_url_reachable(client: "Any", url: str) -> bool:
+    """
+    Thử tải 2 byte đầu của stream (Range request) để chắc chắn ffmpeg sẽ mở được.
+    Trả False nếu 403/404/timeout — dùng để loại instance Piped/Invidious "sống
+    nhưng trả URL chết" trước khi bot tuyên bố đang phát.
+    """
+    try:
+        r = await client.get(
+            url,
+            headers={"Range": "bytes=0-1", "User-Agent": "Mozilla/5.0"},
+            timeout=6.0,
+        )
+        return r.status_code in (200, 206)
+    except Exception:
+        return False
+
+
 async def _invidious_fallback(video_id: str, client: "Any") -> dict[str, Any] | None:
     """
     Nguồn dự phòng thứ 2 nếu tất cả instance Piped đều fail.
@@ -543,27 +560,47 @@ async def _invidious_fallback(video_id: str, client: "Any") -> dict[str, Any] | 
 
     async def _try_one(base: str) -> dict[str, Any] | None:
         try:
-            resp = await client.get(f"{base}/api/v1/videos/{video_id}", timeout=6.0)
+            # local=true: BẮT BUỘC. Không có nó, Invidious trả URL googlevideo.com
+            # trỏ thẳng, bị KHOÁ THEO IP của server Invidious (param ip=...).
+            # ffmpeg trên Railway mở URL đó từ IP khác → 403 → bot vào voice,
+            # hiện "đang phát" nhưng KHÔNG có tiếng. local=true bắt instance
+            # tự proxy stream, URL mở được từ bất kỳ IP nào.
+            resp = await client.get(
+                f"{base}/api/v1/videos/{video_id}",
+                params={"local": "true"},
+                timeout=6.0,
+            )
             if resp.status_code != 200:
                 return None
             data = resp.json()
             formats = (data.get("adaptiveFormats") or []) + (data.get("formatStreams") or [])
-            audio_only = [f for f in formats if "audio" in f.get("type", "")] or formats
-            if not audio_only:
-                return None
-            best = max(audio_only, key=lambda f: int(f.get("bitrate", 0) or 0))
-            if not best.get("url"):
-                return None
-            logger.info("Invidious fallback OK via %s for video_id=%s", base, video_id)
-            return {
-                "id"          : video_id,
-                "title"       : data.get("title", "Unknown Title"),
-                "duration"    : data.get("lengthSeconds", 0),
-                "url"         : best["url"],
-                "thumbnail"   : (data.get("videoThumbnails") or [{}])[0].get("url", ""),
-                "uploader"    : data.get("author", "Unknown"),
-                "webpage_url" : f"https://www.youtube.com/watch?v={video_id}",
-            }
+            audio_only = [f for f in formats if str(f.get("type", "")).startswith("audio")]
+            candidates = sorted(
+                audio_only or formats,
+                key=lambda f: int(f.get("bitrate", 0) or 0),
+                reverse=True,
+            )
+            for fmt in candidates[:3]:
+                stream_url = fmt.get("url") or ""
+                if stream_url.startswith("/"):          # một số instance trả URL tương đối
+                    stream_url = base + stream_url
+                if not stream_url.startswith("http"):
+                    continue
+                # Kiểm tra THẬT SỰ tải được từ IP của Railway trước khi chọn instance
+                # này — tránh chọn nhầm instance trả URL 403 rồi im lặng.
+                if not await _stream_url_reachable(client, stream_url):
+                    continue
+                logger.info("Invidious fallback OK via %s for video_id=%s", base, video_id)
+                return {
+                    "id"          : video_id,
+                    "title"       : data.get("title", "Unknown Title"),
+                    "duration"    : data.get("lengthSeconds", 0),
+                    "url"         : stream_url,
+                    "thumbnail"   : (data.get("videoThumbnails") or [{}])[0].get("url", ""),
+                    "uploader"    : data.get("author", "Unknown"),
+                    "webpage_url" : f"https://www.youtube.com/watch?v={video_id}",
+                }
+            return None
         except Exception:
             return None
 
@@ -606,6 +643,8 @@ async def _piped_fallback(video_id: str, loop: asyncio.AbstractEventLoop) -> dic
                     return None
                 best = max(audio_streams, key=lambda s: s.get("bitrate", 0))
                 if not best.get("url"):
+                    return None
+                if not await _stream_url_reachable(client, best["url"]):
                     return None
                 logger.info("Piped fallback OK via %s for video_id=%s", base, video_id)
                 return {
@@ -766,6 +805,40 @@ def _lock_cookiefile_readonly(cp: str) -> None:
 
 _bootstrap_cookiefile()
 
+
+
+def _new_pcm(url: str, before_options: str, options: str) -> "discord.FFmpegPCMAudio":
+    """
+    Tạo FFmpegPCMAudio và GOM stderr của ffmpeg vào file tạm để ghi log khi bài
+    kết thúc/chết. Trước đây stderr bị nuốt hết nên khi 403 / "Error opening
+    input" bot chỉ im lặng — không có cách nào biết vì sao không ra tiếng.
+    """
+    import tempfile
+    errf = tempfile.TemporaryFile()
+    pcm = discord.FFmpegPCMAudio(
+        url,
+        before_options="-loglevel warning " + before_options,
+        options=options,
+        stderr=errf,
+    )
+    pcm._err_file = errf  # type: ignore[attr-defined]
+    return pcm
+
+
+def _log_ffmpeg_stderr(source: Any) -> str:
+    """Đọc phần cuối stderr ffmpeg (nếu có), log ra và trả về chuỗi."""
+    try:
+        pcm = getattr(source, "original", source)
+        errf = getattr(pcm, "_err_file", None)
+        if errf is None:
+            return ""
+        errf.seek(0)
+        tail = errf.read()[-800:].decode("utf-8", errors="ignore").strip()
+        if tail:
+            logger.warning("FFMPEG stderr: %s", tail.replace("\n", " | "))
+        return tail
+    except Exception:
+        return ""
 
 
 class Track:
@@ -1148,19 +1221,19 @@ class Track:
                 piped_data = None
             if piped_data and piped_data.get("url"):
                 logger.info("Dùng Piped stream cho '%s' — tránh proxy jitter", self.title)
-                pcm = discord.FFmpegPCMAudio(
+                pcm = _new_pcm(
                     piped_data["url"],
-                    before_options=_ffmpeg_before(no_proxy=True),
-                    options=opts,
+                    _ffmpeg_before(no_proxy=True),
+                    opts,
                 )
                 return discord.PCMVolumeTransformer(pcm, volume=safe_vol)
 
-        pcm = discord.FFmpegPCMAudio(
+        pcm = _new_pcm(
             self.url,
-            before_options=_ffmpeg_before(seek=seek, no_proxy=not self._url_via_proxy,
-                                           proxy_override=self._proxy_used,
-                                           headers=self.http_headers),
-            options=opts,
+            _ffmpeg_before(seek=seek, no_proxy=not self._url_via_proxy,
+                           proxy_override=self._proxy_used,
+                           headers=self.http_headers),
+            opts,
         )
         return discord.PCMVolumeTransformer(pcm, volume=safe_vol)
 
@@ -1819,8 +1892,12 @@ class GuildPlayer:
                 _ev   = self._next
                 _403_flag = [False, False, False]  # [is_403, is_geo_blocked, is_eof]
                 _403_retries = [0]
+                _cur_src = [source]  # nguồn đang phát (cập nhật khi resume) — để log stderr ffmpeg đúng nguồn
 
                 def _after(err: Exception | None, _l: asyncio.AbstractEventLoop = _loop, _e: asyncio.Event = _ev) -> None:
+                    _tail = _log_ffmpeg_stderr(_cur_src[0])
+                    if _tail and ("403" in _tail or "Forbidden" in _tail):
+                        _403_flag[0] = True
                     if err:
                         err_s = str(err)
                         logger.error("VC after-error: %s", err_s)
@@ -1993,6 +2070,7 @@ class GuildPlayer:
                                 seek_pos = max(0.0, precise_elapsed - 0.3)
                                 new_src = await track.make_source(self.volume, seek=seek_pos)
                                 self._current_source = new_src
+                                _cur_src[0] = new_src
                                 self._next.clear()
                                 self.vc.play(new_src, after=_after)
                                 # QUAN TRỌNG: reset lại self._start theo đúng vị trí

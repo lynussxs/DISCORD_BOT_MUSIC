@@ -12,7 +12,8 @@ PyNaCl>=1.5.0
 # KHÔNG ghim version cứng (dùng >=) — cố ý để luôn lấy bản MỚI NHẤT mỗi lần
 # build, vì YouTube liên tục đổi cách trả stream (SABR/PO-Token) và yt-dlp vá
 # theo gần như hàng tuần — bản cũ dễ bị "Requested format is not available".
-yt-dlp>=2026.7.4
+# [default] kéo theo yt-dlp-ejs (script giải challenge của YouTube, đi cùng Deno)
+yt-dlp[default]>=2026.7.4
 
 # --- Có thể KHÔNG còn dùng nữa — kiểm tra bằng:
 #   grep -rn "youtube_search\|import requests\|import anthropic" --include="*.py" .

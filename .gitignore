@@ -19,3 +19,7 @@ env/
 .vscode/
 .idea/
 *.swp
+
+# Cookie YouTube = chìa khoá tài khoản Google. TUYỆT ĐỐI không commit.
+cookies.txt
+*.cookies

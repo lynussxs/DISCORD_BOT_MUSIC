@@ -15,6 +15,11 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
+# Deno — JS runtime BẮT BUỘC để yt-dlp giải mã chữ ký/n-challenge của YouTube.
+# Thiếu nó, yt-dlp chỉ thấy format rất hạn chế hoặc báo bot-check/"Requested
+# format is not available". yt-dlp tự tìm `deno` trong PATH.
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 WORKDIR /app
 
 # Copy trước requirements.txt riêng để tận dụng Docker layer cache — chỉ
