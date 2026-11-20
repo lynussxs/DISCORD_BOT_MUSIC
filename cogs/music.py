@@ -807,6 +807,36 @@ _bootstrap_cookiefile()
 
 
 
+def _dave_state(vc: Any) -> str:
+    """Tóm tắt trạng thái mã hoá E2EE (DAVE) của voice connection — để chẩn đoán 'có tiếng ra nhưng không ai nghe'."""
+    try:
+        c = vc._connection
+        sess = c.dave_session
+        return (f"dave_version={c.dave_protocol_version} session={'yes' if sess else 'no'} "
+                f"ready={getattr(sess, 'ready', None)} can_encrypt={c.can_encrypt} "
+                f"downgraded={getattr(c, 'dave_downgraded', None)}")
+    except Exception as exc:
+        return f"dave_state_unavailable({exc})"
+
+
+async def _wait_dave_ready(vc: Any, timeout: float = 6.0) -> bool:
+    """
+    Chờ phiên mã hoá DAVE sẵn sàng trước khi phát. Nếu bắt đầu gửi audio khi
+    phiên chưa ready, discord.py gửi gói KHÔNG mã hoá → kênh bắt buộc E2EE sẽ
+    bỏ gói → bot 'đang phát' nhưng không ai nghe thấy.
+    """
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            c = vc._connection
+            if c.dave_protocol_version == 0 or c.can_encrypt:
+                return True
+        except Exception:
+            return True
+        await asyncio.sleep(0.25)
+    return False
+
+
 class _CountingSource(discord.PCMVolumeTransformer):
     """
     PCMVolumeTransformer có đếm số byte PCM ffmpeg thực sự đã đưa ra. Dùng để
@@ -818,6 +848,7 @@ class _CountingSource(discord.PCMVolumeTransformer):
     def __init__(self, original, volume: float = 1.0) -> None:
         super().__init__(original, volume)
         self.bytes_read = 0
+        self.peak = 0                      # biên độ lớn nhất (0..32767) — =0 nghĩa là toàn im lặng
         self.first_byte_at: float | None = None
 
     def read(self) -> bytes:
@@ -826,6 +857,14 @@ class _CountingSource(discord.PCMVolumeTransformer):
             if self.first_byte_at is None:
                 self.first_byte_at = time.monotonic()
             self.bytes_read += len(data)
+            try:
+                import array
+                a = array.array("h")
+                a.frombytes(data[: len(data) // 2 * 2])
+                if a:
+                    self.peak = max(self.peak, max(max(a), -min(a)))
+            except Exception:
+                pass
         return data
 
 
@@ -1959,6 +1998,9 @@ class GuildPlayer:
                     self._attempt_start = None
                     return  # thoát player loop — sẽ được tạo lại ở lần /play tiếp theo
 
+                if not await _wait_dave_ready(self.vc, 6.0):
+                    logger.warning("DAVE chưa sẵn sàng sau 6s — vẫn phát nhưng có thể không ai nghe được. %s",
+                                   _dave_state(self.vc))
                 self.vc.play(source, after=_after)
                 asyncio.ensure_future(self._audio_watchdog(source, track.title))
 
@@ -2182,23 +2224,23 @@ class GuildPlayer:
             logger.debug("Pre-load failed for '%s': %s", track.title, exc)
 
     async def _audio_watchdog(self, source: Any, title: str) -> None:
-        """Sau 8s ghi log: ffmpeg đã ra bao nhiêu byte audio + trạng thái quyền Speak."""
-        await asyncio.sleep(8)
-        try:
-            n = getattr(source, "bytes_read", -1)
-            me = self.vc.guild.me
-            perms = self.vc.channel.permissions_for(me)
-            vs = me.voice
-            logger.warning(
-                "AUDIO DIAG '%s': ffmpeg_bytes=%d (%s) | playing=%s | can_speak=%s | server_mute=%s | suppress=%s",
-                title, n,
-                "OK có dữ liệu" if n > 0 else "0 BYTE → ffmpeg KẸT/không tải được stream",
-                self.vc.is_playing(), perms.speak,
-                getattr(vs, "mute", None), getattr(vs, "suppress", None),
-            )
-            _log_ffmpeg_stderr(source)
-        except Exception as exc:
-            logger.warning("AUDIO DIAG lỗi: %s", exc)
+        """Log chẩn đoán lúc 3s / 8s / 20s sau khi phát: byte ffmpeg, biên độ, quyền Speak, trạng thái DAVE."""
+        for delay in (3, 5, 12):
+            await asyncio.sleep(delay)
+            try:
+                n = getattr(source, "bytes_read", -1)
+                me = self.vc.guild.me
+                perms = self.vc.channel.permissions_for(me)
+                vs = me.voice
+                logger.warning(
+                    "AUDIO DIAG '%s': ffmpeg_bytes=%d peak=%s | playing=%s | can_speak=%s mute=%s suppress=%s | %s",
+                    title, n, getattr(source, "peak", "?"), self.vc.is_playing(),
+                    perms.speak, getattr(vs, "mute", None), getattr(vs, "suppress", None),
+                    _dave_state(self.vc),
+                )
+            except Exception as exc:
+                logger.warning("AUDIO DIAG lỗi: %s", exc)
+                return
 
     async def _expire_np_message(self, stopped: bool = False) -> None:
         """
