@@ -323,7 +323,9 @@ def test_botcheck_on_direct_jumps_straight_to_proxy(monkeypatch):
         return await m._resolve_stream("https://www.youtube.com/watch?v=" + "y" * 11, asyncio.get_running_loop())
     data, proxy, err = run(go())
     assert data and err is None
-    assert calls == [["visionos"], ["tv_samsung", "visionos", "web_embedded", "android_vr"]]   # 2 lần, không 7
+    assert calls[0] == ["visionos"]
+    assert 1 <= len(calls) - 1 <= m._PROXY_RACE_WIDTH            # chỉ chiến lược proxy (đua ≤2 IP), không 7 lần
+    assert all(len(c) == 4 for c in calls[1:])
 
 
 def test_botcheck_then_proxy_fail_continues_with_remaining(monkeypatch):
@@ -341,3 +343,54 @@ def test_botcheck_then_proxy_fail_continues_with_remaining(monkeypatch):
     assert data                                    # proxy hỏng → vẫn thử tiếp samsung_ck và thắng
     assert calls[1] and len(calls[1]) == 4         # nhảy proxy ngay sau vision
     assert ["tv_samsung"] in calls
+
+
+# ── Đua nhiều proxy + bỏ chiến lược vô ích khi bot-check theo IP ───────────────────────────────
+def test_proxy_pick_returns_distinct_and_rotates():
+    pm = m.WebshareProxyManager()
+    pm._proxies = ["http://a:1", "http://b:2", "http://c:3"]
+    first = pm.pick(2)
+    assert len(set(first)) == 2
+    assert pm.pick(2, exclude=set(first)) == [u for u in pm._proxies if u not in first]   # loại IP đã thử
+    pm._dead_until[first[0]] = time.monotonic() + 60
+    assert first[0] not in pm.pick(3)
+
+
+def test_proxy_race_second_ip_wins_when_first_is_botchecked(monkeypatch):
+    seen = []
+    def fake_extract(opts, url):
+        px = opts["proxy"]; seen.append(px)
+        if px in ("http://bad1:1", "http://bad2:2"):
+            raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot.")
+        return {"url": "https://rr.googlevideo.com/x?c=IOS", "title": "t", "format_id": "251"}
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    monkeypatch.setattr(m._proxy, "_proxies", ["http://bad1:1", "http://bad2:2", "http://ok:3", "http://ok:4"])
+    monkeypatch.setattr(m._proxy, "_idx", 0); monkeypatch.setattr(m._proxy, "_fetch_api", lambda: None)
+    m._proxy._dead.clear(); m._proxy._dead_until.clear()
+    async def go():
+        opts = {"extractor_args": {"youtube": {}}}
+        d = await m._proxy_race(opts, "https://www.youtube.com/watch?v=" + "q" * 11,
+                                asyncio.get_running_loop(), time.monotonic())
+        return d, opts
+    d, opts = run(go())
+    assert opts["proxy"].startswith("http://ok:") and d["format_id"] == "251"     # vòng 2 (IP mới) thắng
+    assert "bad1" in " ".join(seen) and m._proxy._dead_until.get("http://bad1:1")  # IP dính bot-check bị tạm khoá
+
+
+def test_botcheck_everywhere_skips_useless_direct_strategies(monkeypatch):
+    calls = []
+    def fake_extract(opts, url):
+        calls.append(opts["extractor_args"]["youtube"]["player_client"])
+        raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot.")
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    async def go():
+        return await m._resolve_stream("https://www.youtube.com/watch?v=" + "w" * 11, asyncio.get_running_loop())
+    data, proxy, err = run(go())
+    assert data is None and err is not None
+    flat = [c for cl in calls for c in cl]
+    assert "web" not in flat and "mweb" not in flat and "android_vr" not in [c for cl in calls if len(cl) == 2 for c in cl]
+
+
+def test_win_info_reads_client_from_url():
+    assert "client=IOS" in m._win_info({"url": "https://rr.googlevideo.com/v?c=IOS&x=1", "format_id": "18"})
+    assert "client=?" in m._win_info({"url": "https://a/b.m3u8"})

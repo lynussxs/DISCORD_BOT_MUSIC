@@ -224,6 +224,25 @@ class WebshareProxyManager:
         self._idx = 0
         return self._proxies[0]
 
+    def pick(self, n: int, exclude: set[str] | None = None) -> list[str]:
+        """n proxy KHÁC NHAU còn sống (để đua song song); xoay _idx để bài sau dùng IP khác."""
+        self._fetch_api()
+        now = time.monotonic()
+        out: list[str] = []
+        total = len(self._proxies)
+        last = 0
+        for i in range(total):
+            url = self._proxies[(self._idx + i) % total]
+            if url in self._dead or self._dead_until.get(url, 0) > now or (exclude and url in exclude):
+                continue
+            out.append(url)
+            last = i + 1
+            if len(out) >= n:
+                break
+        if out:
+            self._idx = (self._idx + last) % total
+        return out
+
     def force_us(self) -> None:
         """Ép dùng proxy US cho lần yt-dlp tiếp theo (bypass gcr=us geo-lock)."""
         if self.PROXY_US:
@@ -257,6 +276,20 @@ _proxy = WebshareProxyManager()
 # tiếng (18=360p mp4 ~96k, 93/94=HLS 360p/480p, 92/91=HLS 240p/144p) thay vì "best" (có thể là
 # 1080p — ffmpeg vẫn phải tải cả phần video dù có -vn, rất tốn băng thông/RAM trên gói free).
 _YT_FORMAT = "bestaudio/18/93/94/92/91/best[height<=480]/best"
+
+
+def _set_proxy(opts: dict[str, Any], proxy: str) -> None:
+    """Gắn proxy vào opts yt-dlp (kèm header Proxy-Authorization riêng để tránh 407)."""
+    import urllib.parse
+    opts["proxy"] = proxy
+    parsed = urllib.parse.urlparse(proxy)
+    hdrs = dict(opts.get("http_headers") or {})
+    hdrs.pop("Proxy-Authorization", None)
+    if parsed.username and parsed.password:
+        creds = base64.b64encode(f"{parsed.username}:{parsed.password}".encode()).decode()
+        hdrs["Proxy-Authorization"] = f"Basic {creds}"
+    if hdrs:
+        opts["http_headers"] = hdrs
 
 
 def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
@@ -313,15 +346,7 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     if use_proxy:
         proxy = _proxy.get()
         if proxy:
-            # Đảm bảo format đúng cho yt-dlp
-            opts["proxy"] = proxy
-            # Thêm header auth riêng để tránh 407
-            import urllib.parse
-            parsed = urllib.parse.urlparse(proxy)
-            if parsed.username and parsed.password:
-                opts["http_headers"] = opts.get("http_headers", {})
-                creds = base64.b64encode(f"{parsed.username}:{parsed.password}".encode()).decode()
-                opts["http_headers"]["Proxy-Authorization"] = f"Basic {creds}"
+            _set_proxy(opts, proxy)
     if cookies:
         cp = _cookiefile_path()
         if os.path.exists(cp):
@@ -1151,6 +1176,78 @@ _UNAVAILABLE_MARKERS = (
 )
 
 
+def _win_info(data: dict[str, Any]) -> str:
+    """Client thắng không nằm trong info dict → suy từ format đã chọn (c= trong URL googlevideo)."""
+    import urllib.parse as _up
+    u = str(data.get("url") or "")
+    c = (_up.parse_qs(_up.urlparse(u).query).get("c") or ["?"])[0]
+    return f"client={c} fmt={data.get('format_id', '?')} proto={data.get('protocol', '?')}"
+
+
+_PROXY_RACE_WIDTH  = 2      # số proxy chạy song song mỗi vòng
+_PROXY_RACE_ROUNDS = 2      # tối đa 2 vòng (4 IP khác nhau) nếu còn ngân sách thời gian
+_PROXY_ROUND2_MAX_ELAPSED = 12.0
+
+
+async def _proxy_race(
+    opts: dict[str, Any], video_url: str, loop: asyncio.AbstractEventLoop, t_start: float,
+) -> dict[str, Any]:
+    """
+    Chiến lược proxy: IP datacenter của Webshare có IP bị bot-check, có IP không (log 1HaK6z2l2Lw:
+    1 proxy dính bot-check là mất cả bài). Đua _PROXY_RACE_WIDTH proxy KHÁC NHAU song song, ai xong
+    trước thắng; cả vòng fail thì thêm 1 vòng IP mới. Thành công → opts["proxy"] = proxy thắng.
+    RAM: chỉ đua song song khi cgroup < 60% (mỗi extract thêm ~30MB python).
+    Raise lỗi cuối cùng nếu hết cách (hoặc ngay nếu video thật sự không tồn tại).
+    """
+    import copy
+    tried: set[str] = set()
+    last: Exception | None = None
+    for rnd in range(_PROXY_RACE_ROUNDS):
+        if rnd and time.monotonic() - t_start > _PROXY_ROUND2_MAX_ELAPSED:
+            break
+        press = _mem.pressure()
+        width = _PROXY_RACE_WIDTH if (press is None or press < 0.60) else 1
+        proxies = _proxy.pick(width, exclude=tried)
+        if not proxies:
+            break
+        tried.update(proxies)
+        tasks: dict[asyncio.Future, str] = {}
+        for px in proxies:
+            o = copy.deepcopy(opts)
+            _set_proxy(o, px)
+            tasks[asyncio.ensure_future(asyncio.wait_for(
+                loop.run_in_executor(None, _extract_sync, o, video_url),
+                timeout=_RESOLVE_ATTEMPT_TIMEOUT))] = px
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    px = tasks[fut]
+                    try:
+                        data = fut.result()
+                    except asyncio.TimeoutError:
+                        last = RuntimeError(f"yt-dlp timeout sau {_RESOLVE_ATTEMPT_TIMEOUT:.0f}s (proxy)")
+                        _proxy.mark_dead(px, temporary=True)
+                        continue
+                    except Exception as e:  # noqa: BLE001
+                        last = e
+                        low = str(e).lower()
+                        if any(x in low for x in _UNAVAILABLE_MARKERS) and "format" not in low:
+                            raise
+                        _proxy.mark_dead(px, temporary=not ("407" in low or "proxy authentication" in low))
+                        logger.info("PROXY RACE | ...%s fail: %s", px[-15:], str(e)[:60].replace("\n", " "))
+                        continue
+                    opts["proxy"] = px
+                    _set_proxy(opts, px)
+                    logger.info("PROXY RACE | thắng ...%s (vòng %d, %d proxy)", px[-15:], rnd + 1, len(proxies))
+                    return data
+        finally:
+            for fut in pending:       # thread yt-dlp thua cuộc tự chạy nốt, kết quả bị bỏ
+                fut.cancel()
+    raise last or RuntimeError("không có proxy khả dụng")
+
+
 async def _resolve_stream(
     video_url: str, loop: asyncio.AbstractEventLoop,
 ) -> tuple[dict[str, Any] | None, str | None, Exception | None]:
@@ -1192,14 +1289,19 @@ async def _resolve_stream(
         t0 = time.monotonic()
         oom0 = (_mem.cgroup().get("oom_kill") or 0)
         try:
-            data = await asyncio.wait_for(
-                loop.run_in_executor(None, _extract_sync, opts, video_url),
-                timeout=_RESOLVE_ATTEMPT_TIMEOUT,
-            )
+            if strat["proxy"]:
+                opts.pop("proxy", None)
+                data = await _proxy_race(opts, video_url, loop, t_start)
+            else:
+                data = await asyncio.wait_for(
+                    loop.run_in_executor(None, _extract_sync, opts, video_url),
+                    timeout=_RESOLVE_ATTEMPT_TIMEOUT,
+                )
             _breaker.ok(strat["name"])
             for _n in pending_fails:
                 _breaker.fail(_n, vid)
-            logger.info("RESOLVE OK | [%s] %.1fs", strat["name"], time.monotonic() - t0)
+            logger.info("RESOLVE OK | [%s] %.1fs | %s%s", strat["name"], time.monotonic() - t0,
+                        _win_info(data), " | proxy=..." + opts["proxy"][-15:] if opts.get("proxy") else "")
             return data, opts.get("proxy"), None
         except asyncio.TimeoutError:
             last_err = RuntimeError(f"yt-dlp timeout sau {_RESOLVE_ATTEMPT_TIMEOUT:.0f}s ({strat['name']})")
@@ -1259,9 +1361,17 @@ async def _resolve_stream(
                     logger.info("RESOLVE | bot-check ở [%s] → nhảy thẳng sang proxy", strat["name"])
                     break
         if strat["proxy"] and "sign in to confirm" in err_str.lower():
-            skip_names.add(strat["name"])   # bot-check qua proxy → proxy thứ 2 cũng IP datacenter, khỏi tốn thêm ~8s
+            skip_names.add(strat["name"])   # đã đua nhiều IP proxy khác nhau trong _proxy_race → khỏi thử lại
+            if escalated:
+                # Bot-check theo IP: vision + proxy đều dính → embed_vr/web_nock (không cookies) và web
+                # (SABR, +50MB RAM, ~5s) gần như chắc chắn fail y hệt (log 1HaK6z2l2Lw: tốn ~12s vô ích).
+                # Giữ lại samsung_ck/tv_dg_ck (có cookies, rẻ 1-3s) cho video cần đăng nhập.
+                for _s in plan:
+                    if not _s["proxy"] and (not _s["cookies"] or _s.get("late")):
+                        skip_names.add(_s["name"])
+                logger.info("RESOLVE | bot-check cả direct lẫn proxy → bỏ embed_vr/web/web_nock, sớm xuống SoundCloud")
         current = opts.get("proxy", "")
-        if current:
+        if current and not strat["proxy"]:
             if "407" in err_str or "Proxy Authentication" in err_str:
                 _proxy.mark_dead(current, temporary=False)
                 if current == _proxy.PROXY_US:
