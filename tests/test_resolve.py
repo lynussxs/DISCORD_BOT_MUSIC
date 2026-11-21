@@ -513,3 +513,31 @@ def test_from_query_uses_alt_upload_before_soundcloud(monkeypatch):
         return await m.Track.from_query("https://youtu.be/" + "z" * 11, FakeUser(), asyncio.get_running_loop())
     t = run(go())
     assert t.url.endswith("alt.m3u8") and not seen["sc"]       # chưa cần tới SoundCloud
+
+
+# ── Nhớ proxy vừa thắng + working-set RAM (không tính page cache) ───────────────────────────────
+def test_pick_puts_recent_winner_first_and_forgets_it_when_dead():
+    pm = m.WebshareProxyManager()
+    pm._proxies = ["http://a:1", "http://b:2", "http://c:3"]
+    pm._fetch_api = lambda: None
+    pm.note_good("http://c:3")
+    assert pm.pick(2)[0] == "http://c:3"
+    pm.mark_dead("http://c:3", temporary=True)
+    assert "http://c:3" not in pm.pick(3) and pm._last_good is None
+    pm._dead_until.clear(); pm._idx = 1
+    pm.note_good("http://a:1"); pm._last_good = ("http://a:1", time.monotonic() - 4000)   # hết hạn 30 phút
+    assert pm.pick(1) == ["http://b:2"]                    # không ưu tiên a nữa, đi theo thứ tự xoay thường
+
+
+def test_memstat_pressure_excludes_reclaimable_page_cache(monkeypatch):
+    from utils import memstat
+    files = {
+        "/sys/fs/cgroup/memory.current": "497000000\n",       # ≈474MB (có cache)
+        "/sys/fs/cgroup/memory.max": "511705088\n",           # 488MB
+        "/sys/fs/cgroup/memory.events": "oom_kill 0\n",
+        "/sys/fs/cgroup/memory.stat": "anon 200000000\ninactive_file 290000000\n",
+    }
+    monkeypatch.setattr(memstat, "_read", lambda path: files.get(path))
+    assert memstat.cgroup()["used"] == 497000000
+    assert 0.38 < memstat.pressure() < 0.42                # ~207MB/488MB, không phải 97%
+    assert "ws=" in memstat.snapshot()

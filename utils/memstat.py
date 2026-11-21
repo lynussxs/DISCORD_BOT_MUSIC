@@ -30,6 +30,20 @@ def _int(s: str | None) -> int | None:
         return None
 
 
+def _inactive_file() -> int | None:
+    """Page cache không dùng tới (thu hồi được trước khi OOM). cgroup v2: memory.stat 'inactive_file'; v1: 'total_inactive_file'."""
+    for path, key in (("/sys/fs/cgroup/memory.stat", "inactive_file"),
+                      ("/sys/fs/cgroup/memory/memory.stat", "total_inactive_file")):
+        txt = _read(path)
+        if not txt:
+            continue
+        for line in txt.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == key:
+                return _int(parts[1])
+    return None
+
+
 def cgroup() -> dict[str, int | None]:
     """{'used','limit','oom_kill'} tính bằng byte (None nếu không có). Hỗ trợ cgroup v2 rồi v1."""
     used = _int(_read("/sys/fs/cgroup/memory.current"))
@@ -75,12 +89,23 @@ def procs() -> list[tuple[str, int]]:
     return sorted(((n, v // _MB) for n, v in agg.items()), key=lambda x: -x[1])
 
 
-def pressure() -> float | None:
-    """Tỉ lệ dùng/giới hạn của cgroup (0..1), None nếu không biết giới hạn."""
+def working_set() -> int | None:
+    """Bộ nhớ THẬT SỰ đang bị giữ = memory.current − page cache thu hồi được (cách kubelet/cAdvisor tính)."""
     cg = cgroup()
-    if cg["used"] is None or not cg["limit"]:
+    if cg["used"] is None:
         return None
-    return cg["used"] / cg["limit"]
+    return max(0, cg["used"] - (_inactive_file() or 0))
+
+
+def pressure() -> float | None:
+    """Tỉ lệ working-set/giới hạn của cgroup (0..1), None nếu không biết giới hạn.
+    Log 21/11: memory.current báo 97% trong khi python+bgutil chỉ ~190MB (phần còn lại là page cache) → bot
+    tưởng sắp OOM, giảm đua proxy 2→1 và bỏ qua chiến lược nặng một cách oan."""
+    cg = cgroup()
+    ws = working_set()
+    if ws is None or not cg["limit"]:
+        return None
+    return ws / cg["limit"]
 
 
 def snapshot(top: int = 6) -> str:
@@ -91,6 +116,9 @@ def snapshot(top: int = 6) -> str:
         lim = f"{cg['limit'] // _MB}MB" if cg["limit"] else "không giới hạn"
         pct = f" ({cg['used'] * 100 // cg['limit']}%)" if cg["limit"] else ""
         head = f"cgroup={cg['used'] // _MB}/{lim}{pct}"
+    ws = working_set()
+    if ws is not None and cg["used"] is not None and ws != cg["used"]:
+        head += f" ws={ws // _MB}MB"
     if cg["oom_kill"] is not None:
         head += f" oom_kill={cg['oom_kill']}"
     return head + " | " + " ".join(f"{n}={mb}MB" for n, mb in procs()[:top])

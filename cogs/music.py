@@ -149,6 +149,7 @@ class WebshareProxyManager:
         self._fetching   : bool = False
         self._dead_until : dict[str, float] = {}
         self._force_us   : bool = False
+        self._last_good  : tuple[str, float] | None = None   # (proxy vừa thắng, thời điểm) — danh tiếng IP áp cho mọi video
 
     def _fetch_api(self) -> None:
         """
@@ -224,6 +225,11 @@ class WebshareProxyManager:
         self._idx = 0
         return self._proxies[0]
 
+    _GOOD_TTL = 1800.0   # 30 phút
+
+    def note_good(self, url: str) -> None:
+        self._last_good = (url, time.monotonic())
+
     def pick(self, n: int, exclude: set[str] | None = None) -> list[str]:
         """n proxy KHÁC NHAU còn sống (để đua song song); xoay _idx để bài sau dùng IP khác."""
         self._fetch_api()
@@ -231,9 +237,15 @@ class WebshareProxyManager:
         out: list[str] = []
         total = len(self._proxies)
         last = 0
+        lg = self._last_good
+        if lg and now - lg[1] < self._GOOD_TTL and lg[0] in self._proxies and lg[0] not in self._dead \
+                and self._dead_until.get(lg[0], 0) <= now and not (exclude and lg[0] in exclude):
+            out.append(lg[0])    # IP vừa thắng gần đây → thử đầu tiên (log 21/11: vòng 1 hay fail, vòng 2 mới thắng, 8-11s)
         for i in range(total):
+            if len(out) >= n:
+                break
             url = self._proxies[(self._idx + i) % total]
-            if url in self._dead or self._dead_until.get(url, 0) > now or (exclude and url in exclude):
+            if url in out or url in self._dead or self._dead_until.get(url, 0) > now or (exclude and url in exclude):
                 continue
             out.append(url)
             last = i + 1
@@ -257,6 +269,8 @@ class WebshareProxyManager:
         temporary=True → chỉ tạm thời (rate limit), thử lại sau 5 phút.
         temporary=False → dead hẳn.
         """
+        if self._last_good and self._last_good[0] == url:
+            self._last_good = None
         if temporary:
             # Rate limit: thử lại sau 5 phút
             self._dead_until[url] = time.monotonic() + 60  # 60s cho free proxy rotate nhanh hơn
@@ -1322,6 +1336,7 @@ async def _proxy_race(
                         continue
                     opts["proxy"] = px
                     _set_proxy(opts, px)
+                    _proxy.note_good(px)
                     logger.info("PROXY RACE | thắng ...%s (vòng %d, %d proxy)", px[-15:], rnd + 1, len(proxies))
                     return data
         finally:
