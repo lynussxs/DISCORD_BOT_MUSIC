@@ -990,6 +990,39 @@ def _relieve_memory() -> str:
     return "mem-relieved"
 
 
+class _YtHealth:
+    """
+    Sức khoẻ YouTube nói chung. Log 21/11: cả 7 chiến lược fail ~20s/bài rồi SoundCloud mới cứu
+    (1.5s). Sau DEAD_AFTER bài liên tiếp mà mọi chiến lược YouTube đều fail, bài kế tiếp đi
+    SoundCloud TRƯỚC (~2s); nếu SC không có thì mới chạy chuỗi YouTube. Cứ PROBE_EVERY giây lại
+    thử YouTube trước 1 lần để biết khi nào nó sống lại (1 thành công → reset).
+    """
+    DEAD_AFTER  = 2
+    PROBE_EVERY = 600.0
+
+    def __init__(self) -> None:
+        self.fails = 0
+        self.probe_at = 0.0
+
+    def ok(self) -> None:
+        self.fails = 0
+
+    def fail(self) -> None:
+        self.fails += 1
+        self.probe_at = time.monotonic()
+
+    def sc_first(self) -> bool:
+        if self.fails < self.DEAD_AFTER:
+            return False
+        if time.monotonic() - self.probe_at >= self.PROBE_EVERY:
+            self.probe_at = time.monotonic()   # lượt thăm dò YouTube
+            return False
+        return True
+
+
+_yt_health = _YtHealth()
+
+
 class _StrategyBreaker:
     TRIP_AFTER = 3
     COOLDOWN   = 600.0
@@ -1428,12 +1461,18 @@ async def _soundcloud_resolve(
         if not pick:
             logger.info("SC FALLBACK | không có kết quả khớp cho '%s'", title[:60])
             return None
+        # yt-dlp xếp opus > mp3 nên "bestaudio" trên SoundCloud chọn hls_opus (.m3u8, segment Ogg) —
+        # ffmpeg đọc xong playlist (22806 B ≈ playlist HLS của bài 252s) rồi KHÔNG ra PCM nào (log 21/11:
+        # peak=0, đệm=0.0s → im lặng). Ép progressive http(s) mp3 trước; HLS chỉ là phương án chót.
         d_opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 8,
-                  "format": "bestaudio/best"}
+                  "format": ("bestaudio[protocol^=http][ext=mp3]/http_mp3_128/"
+                             "bestaudio[protocol^=http]/bestaudio/best")}
         data = await asyncio.wait_for(
             loop.run_in_executor(None, _extract_sync, d_opts, pick["url"]), timeout=12.0)
         if not data.get("url"):
             return None
+        if ".m3u8" in str(data.get("url")) or "m3u8" in str(data.get("protocol") or ""):
+            logger.warning("SC FALLBACK | chỉ có HLS (%s) — ffmpeg dễ không ra tiếng", data.get("format_id"))
         data["uploader"] = f"{data.get('uploader') or data.get('channel') or '?'} · SoundCloud"
         data["_source"] = "soundcloud"
         logger.info("SC FALLBACK OK | '%s' → '%s' (%.1fs)", title[:50], str(data.get("title"))[:50],
@@ -1557,10 +1596,23 @@ class Track:
             logger.info("RESOLVE CACHE HIT | '%s'", c_data.get("title", "?"))
             return cls(c_data, requester, via_proxy=c_via_proxy, proxy_used=c_proxy)
 
+        # YouTube đang chết liên tiếp → thử SoundCloud trước (nhanh ~2s thay vì ~20s).
+        if _SC_ENABLED and _yt_health.sc_first():
+            _t = yt_meta.get("title") or _diag_meta.get(video_url, {}).get("title") or ""
+            if _t:
+                sc_fast = await _soundcloud_resolve(_t, yt_meta.get("duration"), loop)
+                if sc_fast:
+                    logger.info("SC-FIRST | YouTube fail %d bài liên tiếp → dùng SoundCloud ngay", _yt_health.fails)
+                    _resolve_cache_put(video_url, sc_fast, False, None)
+                    return cls(sc_fast, requester, via_proxy=False)
+
         data, resolved_proxy_str, last_err = await _resolve_stream(video_url, loop)
         resolved_via_proxy = bool(resolved_proxy_str)
+        if data is not None:
+            _yt_health.ok()
 
         if data is None:
+            _yt_health.fail()
             # ── Mọi chiến lược YouTube đều fail ──
             # (1) Chẩn đoán (cũng lấy title/duration cho bước SoundCloud).
             summary, hint = await _diagnose_failure(video_url, loop)
@@ -1754,6 +1806,12 @@ class Track:
         logger.info("PREBUFFER | '%s' %s sau %.1fs (đệm=%.1fs, proxy=%s)", self.title,
                     "sẵn sàng" if ready else "HẾT GIỜ CHỜ — phát luôn", time.monotonic() - t0,
                     buf.buffered_s, "yes" if via_proxy else "no")
+        # ffmpeg không ra nổi 1 frame PCM sau cả timeout (vd SoundCloud HLS-opus: đọc xong playlist
+        # rồi đứng) → phát chỉ là im lặng suốt cả bài. Báo lỗi rõ ràng để player bỏ qua/thử bài khác.
+        if not ready and buf.buffered_s == 0.0 and "sndcdn.com" in (self.url or ""):
+            _log_ffmpeg_stderr(src)
+            src.cleanup()
+            raise RuntimeError("Nguồn SoundCloud không giải mã được (ffmpeg không ra âm thanh)")
         return src
 
 

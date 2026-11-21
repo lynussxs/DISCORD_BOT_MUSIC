@@ -21,7 +21,7 @@ from cogs import music as m  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
-    m._breaker.__init__()
+    m._breaker.__init__(); m._yt_health.__init__()
     m._resolve_cache.clear()
     m._search_cache.clear()
     m._diag_meta.clear()
@@ -212,3 +212,57 @@ def test_from_query_sc_disabled(monkeypatch):
 def test_format_selector_never_prefers_big_muxed_video():
     assert m._YT_FORMAT.startswith("bestaudio/18/")
     assert "best[height<=480]" in m._YT_FORMAT
+
+
+# ── SoundCloud: phải ép progressive mp3, không để yt-dlp chọn hls_opus ─────────
+def test_soundcloud_requests_progressive_mp3(monkeypatch):
+    seen = {}
+    def fake_extract(opts, url):
+        if url.startswith("scsearch"):
+            return {"entries": [E("Charlie Puth - Attention", 208, "Charlie Puth")]}
+        seen["format"] = opts["format"]
+        return {"url": "https://cf-media.sndcdn.com/a.mp3", "title": "Attention", "duration": 208}
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    async def go():
+        return await m._soundcloud_resolve("Charlie Puth - Attention", 208, asyncio.get_running_loop())
+    assert run(go())
+    fmt = seen["format"]
+    assert fmt.index("http_mp3_128") < fmt.index("bestaudio/best")
+    assert fmt.startswith("bestaudio[protocol^=http]")
+
+
+# ── YouTube chết liên tiếp → SoundCloud trước, thăm dò YouTube định kỳ ─────────
+def test_yt_health_sc_first_and_probe():
+    h = m._YtHealth()
+    assert not h.sc_first()
+    h.fail(); assert not h.sc_first()
+    h.fail(); assert h.sc_first()
+    h.probe_at -= m._YtHealth.PROBE_EVERY + 1
+    assert not h.sc_first()          # đến hạn thăm dò → thử YouTube
+    assert h.sc_first()              # xong lượt thăm dò → lại SC trước
+    h.ok(); assert not h.sc_first()
+
+
+def test_from_query_sc_first_skips_youtube_chain(monkeypatch):
+    m._yt_health.__init__()
+    m._yt_health.fails = 2
+    m._yt_health.probe_at = time.monotonic()
+    yt_calls = []
+    def fake_extract(opts, url):
+        if url.startswith("scsearch"):
+            return {"entries": [E("Charlie Puth - Attention", 208, "Charlie Puth")]}
+        if "soundcloud.com" in url:
+            return {"url": "https://cf-media.sndcdn.com/a.mp3", "title": "Attention", "duration": 208}
+        yt_calls.append(url)
+        raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot")
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    async def fake_diag(v, l):
+        return ("s", "")
+    monkeypatch.setattr(m, "_diagnose_failure", fake_diag)
+    async def go():
+        q = "Charlie Puth - Attention"
+        m._search_cache["ytsearch1:" + q] = (time.monotonic(), "https://www.youtube.com/watch?v=" + "a" * 11)
+        return await m.Track.from_query(q, FakeUser(), asyncio.get_running_loop())
+    t = run(go())
+    assert t.url.endswith("a.mp3") and yt_calls == []
+    m._yt_health.__init__()
