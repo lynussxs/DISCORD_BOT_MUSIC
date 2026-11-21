@@ -1010,12 +1010,20 @@ _YT_STRATEGIES: list[dict[str, Any]] = [
     # (video giới hạn tuổi cần đăng nhập).
     {"name": "vision",     "clients": ["visionos"],                       "cookies": False, "proxy": False},
     {"name": "samsung_ck", "clients": ["tv_samsung"],                    "cookies": True,  "proxy": False},
+    # 'tv' = client DUY NHẤT (cùng tv_samsung/tv_downgraded/web_embedded/visionos) không đòi GVS PO-Token
+    # mà bot CHƯA từng thử (đã kiểm bằng INNERTUBE_CLIENTS). Cookies vượt được bot-check (log 1LJKk3UFzwM:
+    # samsung_ck lỗi format chứ không phải bot-check) nên đây là hướng hợp lý cho video bị chặn IP.
+    {"name": "tv_ck",      "clients": ["tv"],                              "cookies": True,  "proxy": False},
     {"name": "embed_vr",   "clients": ["web_embedded", "android_vr"],     "cookies": False, "proxy": False},
     {"name": "tv_dg_ck",   "clients": ["tv_downgraded"],                  "cookies": True,  "proxy": False},
     # 'late' = chỉ thử SAU proxy. Log 21/11 (nhiều video): web luôn "Requested format is not available"
     # (SABR), web_nock luôn bot-check, chưa thắng lần nào; web còn tốn ~5s + làm RAM cgroup vọt lên 70-80%.
     {"name": "web",        "clients": ["web", "mweb"],                    "cookies": True,  "proxy": False, "late": True},
     {"name": "web_nock",   "clients": ["web", "mweb"],                    "cookies": False, "proxy": False, "late": True},
+    # web_safari trả HLS (m3u8) — không dính "SABR-only" của https; cần GVS PO-Token (bgutil cấp được, log DIAG
+    # 'Retrieved a gvs PO Token'). Nặng RAM (Deno + bgutil) nên 'heavy': bỏ qua khi cgroup ≥ 65%. THỬ NGHIỆM —
+    # chưa kiểm chứng với YouTube thật; xem log 'RESOLVE OK | [safari_ck]'.
+    {"name": "safari_ck",  "clients": ["web_safari"],                      "cookies": True,  "proxy": False, "late": True, "heavy": True},
     {"name": "proxy",      "clients": ["tv_samsung", "visionos", "web_embedded", "android_vr"], "cookies": False, "proxy": True},
 ]
 
@@ -1343,12 +1351,16 @@ async def _resolve_stream(
     skip_names: set[str] = set()
     healed = False      # chỉ tự hồi phục PO-Token provider 1 lần cho mỗi bài
     escalated = False   # chỉ nhảy sang proxy 1 lần/bài khi gặp bot-check
+    bot_err: Exception | None = None   # lỗi bot-check đầu tiên — là NGUYÊN NHÂN THẬT, đừng để lỗi phụ ("page needs to be reloaded") che mất
 
     i = -1
     while i + 1 < len(plan):
         i += 1
         strat = plan[i]
         if strat["name"] in skip_names:
+            continue
+        if strat.get("heavy") and (_mem.pressure() or 0.0) >= 0.65:
+            logger.info("RESOLVE | bỏ qua [%s]: RAM cgroup ≥ 65%%", strat["name"])
             continue
         if i and time.monotonic() - t_start > _RESOLVE_TOTAL_BUDGET:
             logger.warning("RESOLVE | quá %.0fs, dừng thử thêm chiến lược", _RESOLVE_TOTAL_BUDGET)
@@ -1423,6 +1435,8 @@ async def _resolve_stream(
                 continue
 
         pending_fails.append(strat["name"])
+        if bot_err is None and "sign in to confirm" in _el:
+            bot_err = last_err
         # Bot-check ("Sign in to confirm...") khi đi thẳng từ IP Railway: log 5GG_MkQYQq0 & qe7stKL5qco
         # cho thấy mọi chiến lược trực tiếp còn lại đều fail y hệt (~13s) rồi proxy mới thắng → nhảy
         # thẳng sang proxy (1 lần/bài), các chiến lược trực tiếp còn lại thử sau nếu proxy cũng hỏng.
@@ -1440,10 +1454,8 @@ async def _resolve_stream(
                 # Bot-check theo IP: vision + proxy đều dính → embed_vr/web_nock (không cookies) và web
                 # (SABR, +50MB RAM, ~5s) gần như chắc chắn fail y hệt (log 1HaK6z2l2Lw: tốn ~12s vô ích).
                 # Giữ lại samsung_ck/tv_dg_ck (có cookies, rẻ 1-3s) cho video cần đăng nhập.
-                for _s in plan:
-                    if not _s["proxy"] and (not _s["cookies"] or _s.get("late")):
-                        skip_names.add(_s["name"])
-                logger.info("RESOLVE | bot-check cả direct lẫn proxy → bỏ embed_vr/web/web_nock, sớm xuống SoundCloud")
+                skip_names.update({"embed_vr", "web", "web_nock"})
+                logger.info("RESOLVE | bot-check cả direct lẫn proxy → bỏ embed_vr/web/web_nock (còn tv_ck/samsung_ck/tv_dg_ck/safari_ck dùng cookies)")
         current = opts.get("proxy", "")
         if current and not strat["proxy"]:
             if "407" in err_str or "Proxy Authentication" in err_str:
@@ -1458,7 +1470,7 @@ async def _resolve_stream(
         if i < len(plan) - 1:
             await asyncio.sleep(0.3)
 
-    return None, None, last_err
+    return None, None, (bot_err or last_err)
 
 
 class _WarnCapture:
@@ -1863,6 +1875,10 @@ class Track:
                     piped_data = None
                 if piped_data:
                     return cls(piped_data, requester, via_proxy=False)
+            if not hint and last_err is not None and "sign in to confirm" in str(last_err).lower():
+                hint = ("YouTube đang chặn IP máy chủ bot (bot-check) với video này — thử lại sau ít phút, "
+                        "hoặc dùng bản upload khác của bài.")
+            asyncio.ensure_future(_trim_memory_soon(loop))
             if last_err is not None:
                 last_err._diag_hint = hint  # type: ignore[attr-defined]
             # Để lỗi gốc của yt-dlp hiện ra (chính xác hơn việc tự đoán nguyên nhân).

@@ -432,3 +432,40 @@ def test_refresh_url_raises_instead_of_reusing_dead_url(monkeypatch):
     with pytest.raises(Exception):
         run(go())
     assert t.url == "https://old/403"
+
+
+# ── Client mới + chọn lỗi gốc ───────────────────────────────────────────────────────────────
+def test_new_strategies_use_real_clients_and_order():
+    names = [s["name"] for s in m._breaker.plan()]
+    assert names.index("tv_ck") > names.index("samsung_ck") and names.index("tv_ck") < names.index("proxy")
+    assert names.index("safari_ck") > names.index("proxy")
+    st = {s["name"]: s for s in m._YT_STRATEGIES}
+    assert st["tv_ck"]["clients"] == ["tv"] and st["safari_ck"]["clients"] == ["web_safari"] and st["safari_ck"]["heavy"]
+
+
+def test_final_error_is_the_botcheck_not_the_secondary_error(monkeypatch):
+    def fake_extract(opts, url):
+        cl = opts["extractor_args"]["youtube"]["player_client"]
+        if cl == ["visionos"] or len(cl) == 4:
+            raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot.")
+        raise RuntimeError("ERROR: [youtube] x: The page needs to be reloaded.")
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    monkeypatch.setattr(m._mem, "pressure", lambda: 0.1)
+    async def go():
+        return await m._resolve_stream("https://www.youtube.com/watch?v=" + "b" * 11, asyncio.get_running_loop())
+    data, proxy, err = run(go())
+    assert data is None and "sign in to confirm" in str(err).lower()
+
+
+def test_heavy_strategy_skipped_under_memory_pressure(monkeypatch):
+    seen = []
+    def fake_extract(opts, url):
+        seen.append(opts["extractor_args"]["youtube"]["player_client"])
+        raise RuntimeError("ERROR: [youtube] x: Requested format is not available")
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    monkeypatch.setattr(m._mem, "pressure", lambda: 0.9)
+    monkeypatch.setattr(m._pot, "heal", lambda *a, **k: "ok")
+    async def go():
+        return await m._resolve_stream("https://www.youtube.com/watch?v=" + "h" * 11, asyncio.get_running_loop())
+    run(go())
+    assert ["web_safari"] not in seen and ["tv"] in seen
