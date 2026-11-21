@@ -269,6 +269,7 @@ class WebshareProxyManager:
         return self.mark_dead(current, temporary=True)
 
 _proxy = WebshareProxyManager()
+_proxy._fetch_api()   # lấy danh sách Webshare NGAY lúc khởi động (nền), không đợi tới /play đầu tiên
 
 # ── yt-dlp options ─────────────────────────────────────────────────────────────
 
@@ -1176,6 +1177,72 @@ _UNAVAILABLE_MARKERS = (
 )
 
 
+# Client mà URL googlevideo CẦN PO-Token (yt-dlp: GVS_PO_TOKEN_POLICY required=True). Log 21/11 (75Tqdnwitgw):
+# qua proxy yt-dlp chọn itag 18 của ANDROID_VR nhưng URL KHÔNG có "pot=" → ffmpeg 403 ngay → bot refresh 6 lần
+# bằng chính URL chết đó (32s rồi bỏ bài). Giờ: URL kiểu này phải qua 1 request thử trước khi nhận.
+_POT_CLIENT_IDS = ("android_vr", "ios", "android", "web", "mweb")
+_POT_URL_CLIENTS = tuple(c.upper() for c in _POT_CLIENT_IDS)
+
+
+def _url_client(url: str) -> str:
+    import urllib.parse as _up
+    return (_up.parse_qs(_up.urlparse(url or "").query).get("c") or [""])[0].upper()
+
+
+def _needs_probe(data: dict[str, Any]) -> bool:
+    u = str(data.get("url") or "")
+    return bool(u) and _url_client(u) in _POT_URL_CLIENTS and "pot=" not in u
+
+
+def _probe_sync(data: dict[str, Any], proxy: str | None) -> bool:
+    """GET Range 0-1 với đúng http_headers của yt-dlp (+ đúng proxy đã resolve). False CHỈ khi 401/403/404/410;
+    lỗi mạng/timeout → True (không phạt oan, ffmpeg còn cơ chế retry riêng)."""
+    import httpx
+    url = str(data.get("url") or "")
+    hdrs = {str(k): str(v) for k, v in (data.get("http_headers") or {}).items() if k and v}
+    hdrs["Range"] = "bytes=0-1"
+    kw: dict[str, Any] = {"verify": False, "timeout": 6.0, "follow_redirects": True, "headers": hdrs}
+    try:
+        try:
+            cli = httpx.Client(proxy=proxy, **kw) if proxy else httpx.Client(**kw)
+        except TypeError:                       # httpx cũ: tham số tên "proxies"
+            cli = httpx.Client(proxies=proxy, **kw) if proxy else httpx.Client(**kw)
+        with cli as c, c.stream("GET", url) as r:
+            code = r.status_code
+    except Exception:  # noqa: BLE001
+        return True
+    if code in (401, 403, 404, 410):
+        logger.warning("PROBE | HTTP %d cho client=%s (%s)", code, _url_client(url) or "?", "proxy" if proxy else "direct")
+        return False
+    return True
+
+
+async def _extract_verified(
+    opts: dict[str, Any], video_url: str, loop: asyncio.AbstractEventLoop,
+) -> dict[str, Any]:
+    """extract + (chỉ khi client cần PO-Token mà URL thiếu pot=) kiểm tra URL; 403 → thử lại 1 lần với
+    các client KHÔNG đòi PO-Token (tv_samsung/visionos/web_embedded...) trên cùng proxy; vẫn hỏng → raise."""
+    import copy
+    data = await loop.run_in_executor(None, _extract_sync, opts, video_url)
+    if not _needs_probe(data):
+        return data
+    px = opts.get("proxy")
+    if await loop.run_in_executor(None, _probe_sync, data, px):
+        return data
+    clients = list((opts.get("extractor_args", {}).get("youtube", {}) or {}).get("player_client") or [])
+    safe = [c for c in clients if c not in _POT_CLIENT_IDS]
+    if not safe or safe == clients:
+        raise RuntimeError("stream probe 403 (client thiếu PO-Token)")
+    logger.info("PROBE | URL %s 403 (thiếu pot) → thử lại không dùng %s", _url_client(data["url"]),
+                [c for c in clients if c in _POT_CLIENT_IDS])
+    o2 = copy.deepcopy(opts)
+    o2["extractor_args"]["youtube"]["player_client"] = safe
+    data = await loop.run_in_executor(None, _extract_sync, o2, video_url)
+    if _needs_probe(data) and not await loop.run_in_executor(None, _probe_sync, data, px):
+        raise RuntimeError("stream probe 403 (client thiếu PO-Token)")
+    return data
+
+
 def _win_info(data: dict[str, Any]) -> str:
     """Client thắng không nằm trong info dict → suy từ format đã chọn (c= trong URL googlevideo)."""
     import urllib.parse as _up
@@ -1200,6 +1267,12 @@ async def _proxy_race(
     Raise lỗi cuối cùng nếu hết cách (hoặc ngay nếu video thật sự không tồn tại).
     """
     import copy
+    # Lần đầu sau khi khởi động, danh sách Webshare (API) có thể chưa về → đừng để proxy free công cộng
+    # đứng đầu (log 21/11: thắng bằng 34.43.46.91:80 — proxy free, URL sau đó 403). Chờ tối đa 3s.
+    for _ in range(30):
+        if not _proxy._fetching:
+            break
+        await asyncio.sleep(0.1)
     tried: set[str] = set()
     last: Exception | None = None
     for rnd in range(_PROXY_RACE_ROUNDS):
@@ -1216,7 +1289,7 @@ async def _proxy_race(
             o = copy.deepcopy(opts)
             _set_proxy(o, px)
             tasks[asyncio.ensure_future(asyncio.wait_for(
-                loop.run_in_executor(None, _extract_sync, o, video_url),
+                _extract_verified(o, video_url, loop),
                 timeout=_RESOLVE_ATTEMPT_TIMEOUT))] = px
         pending = set(tasks)
         try:
@@ -1235,7 +1308,8 @@ async def _proxy_race(
                         low = str(e).lower()
                         if any(x in low for x in _UNAVAILABLE_MARKERS) and "format" not in low:
                             raise
-                        _proxy.mark_dead(px, temporary=not ("407" in low or "proxy authentication" in low))
+                        if "stream probe" not in low:      # proxy vẫn tốt, chỉ là client thiếu PO-Token
+                            _proxy.mark_dead(px, temporary=not ("407" in low or "proxy authentication" in low))
                         logger.info("PROXY RACE | ...%s fail: %s", px[-15:], str(e)[:60].replace("\n", " "))
                         continue
                     opts["proxy"] = px
@@ -1294,7 +1368,7 @@ async def _resolve_stream(
                 data = await _proxy_race(opts, video_url, loop, t_start)
             else:
                 data = await asyncio.wait_for(
-                    loop.run_in_executor(None, _extract_sync, opts, video_url),
+                    _extract_verified(opts, video_url, loop),
                     timeout=_RESOLVE_ATTEMPT_TIMEOUT,
                 )
             _breaker.ok(strat["name"])
@@ -1842,8 +1916,8 @@ class Track:
         # force_proxy=True → chỉ thử proxy (skip direct hoàn toàn)
         if force_proxy:
             proxy_order = (True,)
-        elif self._url_via_proxy and _breaker.direct_dead():
-            proxy_order = (True, False)   # direct đang bị breaker khoá → khỏi tốn 1 lượt fail
+        elif self._url_via_proxy:
+            proxy_order = (True, False)   # URL cũ gắn với IP proxy; direct từ Railway thường bot-check (log 21/11: tốn ~3s/lần)
         else:
             proxy_order = (False, True)
         for use_proxy in proxy_order:
@@ -1865,7 +1939,12 @@ class Track:
                 }
                 if force_itag18:
                     opts["format"] = "18"
-                data = await loop.run_in_executor(None, _extract_sync, opts, self.webpage_url)
+                if use_proxy:
+                    opts.pop("proxy", None)
+                    data = await _proxy_race(opts, self.webpage_url, loop, time.monotonic())
+                else:
+                    data = await asyncio.wait_for(
+                        _extract_verified(opts, self.webpage_url, loop), timeout=_RESOLVE_ATTEMPT_TIMEOUT)
                 new_url = data.get("url", "")
                 if new_url and "youtube.com/watch" not in new_url:
                     self.url = new_url
@@ -1881,8 +1960,12 @@ class Track:
                 last_exc = exc
                 if not use_proxy:
                     continue
+        # Trước đây im lặng quay lại với URL CŨ đã 403 → bot lặp 6 lần (~32s) rồi bỏ bài. Giờ báo lỗi để vòng
+        # phát dừng ngay và báo người dùng.
         if last_exc:
             logger.warning("Failed to refresh URL for '%s': %s", self.title, last_exc)
+        if force:
+            raise last_exc or RuntimeError("refresh không ra URL mới")
 
     async def make_source(self, volume: float, seek: float = 0) -> discord.PCMVolumeTransformer:
         """

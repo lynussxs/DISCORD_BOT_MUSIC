@@ -362,7 +362,7 @@ def test_proxy_race_second_ip_wins_when_first_is_botchecked(monkeypatch):
         px = opts["proxy"]; seen.append(px)
         if px in ("http://bad1:1", "http://bad2:2"):
             raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot.")
-        return {"url": "https://rr.googlevideo.com/x?c=IOS", "title": "t", "format_id": "251"}
+        return {"url": "https://rr.googlevideo.com/x?c=TVHTML5", "title": "t", "format_id": "251"}
     monkeypatch.setattr(m, "_extract_sync", fake_extract)
     monkeypatch.setattr(m._proxy, "_proxies", ["http://bad1:1", "http://bad2:2", "http://ok:3", "http://ok:4"])
     monkeypatch.setattr(m._proxy, "_idx", 0); monkeypatch.setattr(m._proxy, "_fetch_api", lambda: None)
@@ -394,3 +394,41 @@ def test_botcheck_everywhere_skips_useless_direct_strategies(monkeypatch):
 def test_win_info_reads_client_from_url():
     assert "client=IOS" in m._win_info({"url": "https://rr.googlevideo.com/v?c=IOS&x=1", "format_id": "18"})
     assert "client=?" in m._win_info({"url": "https://a/b.m3u8"})
+
+
+# ── Probe URL thiếu PO-Token (log 75Tqdnwitgw: ANDROID_VR itag 18 qua proxy → ffmpeg 403 ×6) ──────
+def test_android_vr_url_without_pot_403_retries_with_safe_clients(monkeypatch):
+    calls = []
+    def fake_extract(opts, url):
+        cl = opts["extractor_args"]["youtube"]["player_client"]
+        calls.append(list(cl))
+        c = "ANDROID_VR" if "android_vr" in cl else "TVHTML5"
+        return {"url": f"https://rr.googlevideo.com/x?c={c}", "title": "t", "format_id": "18"}
+    probes = []
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    monkeypatch.setattr(m, "_probe_sync", lambda d, px: (probes.append(d["url"]), "ANDROID_VR" not in d["url"])[1])
+    async def go():
+        o = {"extractor_args": {"youtube": {"player_client": ["tv_samsung", "visionos", "web_embedded", "android_vr"]}}}
+        return await m._extract_verified(o, "https://www.youtube.com/watch?v=" + "p" * 11, asyncio.get_running_loop())
+    d = run(go())
+    assert "TVHTML5" in d["url"] and calls[1] == ["tv_samsung", "visionos", "web_embedded"]
+
+
+def test_url_with_pot_or_safe_client_is_not_probed():
+    assert not m._needs_probe({"url": "https://a/b?c=ANDROID_VR&pot=abc"})
+    assert not m._needs_probe({"url": "https://a/b?c=TVHTML5"})
+    assert not m._needs_probe({"url": "https://a/b.m3u8"})
+    assert m._needs_probe({"url": "https://a/b?c=ANDROID_VR"})
+
+
+def test_refresh_url_raises_instead_of_reusing_dead_url(monkeypatch):
+    t = m.Track({"url": "https://old/403", "title": "t", "webpage_url": "https://www.youtube.com/watch?v=" + "r" * 11,
+                 "duration": 100}, None, via_proxy=True)
+    def fake_extract(opts, url):
+        raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot.")
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    async def go():
+        await t.refresh_url(asyncio.get_running_loop(), force=True)
+    with pytest.raises(Exception):
+        run(go())
+    assert t.url == "https://old/403"
