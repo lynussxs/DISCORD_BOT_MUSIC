@@ -23,3 +23,5 @@ env/
 # Cookie YouTube = chìa khoá tài khoản Google. TUYỆT ĐỐI không commit.
 cookies.txt
 *.cookies
+bgutil-pot
+bgutil-pot.log

@@ -109,7 +109,6 @@ def keep_alive() -> None:
 
 
 # ── PO-Token provider (bgutil) — chạy ngầm để yt-dlp vượt bot-check YouTube ──
-_bgutil_proc: "subprocess.Popen | None" = None
 
 
 def _download_deno() -> None:
@@ -174,7 +173,6 @@ def _bgutil_setup_and_run() -> None:
     nếu bước nào lỗi, yt-dlp vẫn hoạt động bình thường (chỉ mất khả năng vượt
     PO-Token).
     """
-    global _bgutil_proc
     import urllib.request
 
     log  = logging.getLogger("bgutil")
@@ -202,17 +200,10 @@ def _bgutil_setup_and_run() -> None:
     os.environ["PATH"] = root + os.pathsep + os.environ.get("PATH", "")
 
     try:
-        # Chạy im lặng — log verbose của bgutil-pot chỉ cần khi debug thủ công.
-        _bgutil_proc = subprocess.Popen(
-            [bin_path, "server", "--host", "127.0.0.1", "--port", "4416"],
-            cwd=root,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        log.info(
-            "PO-Token provider (bgutil-pot, Rust) started — PID %d, http://127.0.0.1:4416",
-            _bgutil_proc.pid,
-        )
+        # Giám sát + tự restart + ghi stderr ra bgutil-pot.log (trước đây Popen 1 lần, log vào
+        # /dev/null, chết thì không ai biết → web mất PO-Token cho tới khi restart cả bot).
+        from utils import pot_provider
+        pot_provider.start(bin_path, root)
     except Exception as exc:
         log.warning("Không khởi động được bgutil-pot: %s", exc)
 

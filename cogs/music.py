@@ -58,6 +58,7 @@ from discord.ext import commands
 
 import config
 from utils.logger import get_logger
+from utils import pot_provider as _pot
 
 logger = get_logger(__name__)
 
@@ -1082,8 +1083,12 @@ async def _resolve_stream(
     # không phải chiến lược hỏng — phạt lúc đó sẽ khoá oan cả 'web' đang chạy tốt với video khác.
     pending_fails: list[str] = []
     skip_names: set[str] = set()
+    healed = False      # chỉ tự hồi phục PO-Token provider 1 lần cho mỗi bài
 
-    for i, strat in enumerate(plan):
+    i = -1
+    while i + 1 < len(plan):
+        i += 1
+        strat = plan[i]
         if strat["name"] in skip_names:
             continue
         if i and time.monotonic() - t_start > _RESOLVE_TOTAL_BUDGET:
@@ -1121,6 +1126,25 @@ async def _resolve_stream(
             if any(x in _low for x in _UNAVAILABLE_MARKERS) and "format" not in _low:
                 raise
 
+        # Nghi PO-Token hỏng: client web mất token → yt-dlp loại hết format https → "Requested
+        # format is not available" (hoặc "page needs to be reloaded" khi session cũ). Đúng kiểu lỗi
+        # "vài bài đầu ổn rồi mọi bài đều fail tới khi restart bot". Thử hồi phục provider (restart
+        # nếu chết/không ping, còn sống thì xoá cache token) rồi thử lại CHÍNH chiến lược này 1 lần.
+        _el = err_str.lower()
+        if (not healed and strat["cookies"] and not strat["proxy"]
+                and ("requested format is not available" in _el or "page needs to be reloaded" in _el)):
+            healed = True
+            try:
+                action = await asyncio.wait_for(
+                    loop.run_in_executor(None, _pot.heal, f"{strat['name']}: {err_str[:50]}"), timeout=20.0)
+            except Exception as _he:  # noqa: BLE001
+                action = f"lỗi: {_he}"
+            logger.warning("POT HEAL | [%s] lỗi '%s' → %s (provider=%s)", strat["name"],
+                           err_str[:50].replace("\n", " "), action, _pot.status())
+            if action in ("restarted", "cache-cleared"):
+                plan.insert(i + 1, strat)   # thử lại đúng chiến lược này; chưa tính là "fail" của nó
+                continue
+
         pending_fails.append(strat["name"])
         if strat["proxy"] and "sign in to confirm" in err_str.lower():
             skip_names.add(strat["name"])   # bot-check qua proxy → proxy thứ 2 cũng IP datacenter, khỏi tốn thêm ~8s
@@ -1141,22 +1165,41 @@ async def _resolve_stream(
     return None, None, last_err
 
 
+class _WarnCapture:
+    """Logger giả cho yt-dlp: gom warning/error để đưa vào log chẩn đoán (opts mặc định tắt hết)."""
+    def __init__(self) -> None:
+        self.msgs: list[str] = []
+    def debug(self, msg: str) -> None: pass
+    def info(self, msg: str) -> None: pass
+    def warning(self, msg: str) -> None: self.msgs.append(str(msg))
+    def error(self, msg: str) -> None: self.msgs.append(str(msg))
+
+
 async def _diagnose_failure(video_url: str, loop: asyncio.AbstractEventLoop) -> tuple[str, str]:
     """
-    Khi MỌI chiến lược đều fail: hỏi yt-dlp thông tin metadata (không đòi format) để biết vì sao.
+    Khi MỌI chiến lược đều fail: hỏi yt-dlp metadata (không đòi format) để biết vì sao.
     Trả về (tóm tắt để log, gợi ý tiếng Việt cho người dùng — rỗng nếu không rõ).
+    Tóm tắt có cả cảnh báo của yt-dlp (vd "formats were skipped as they require a GVS PO Token")
+    và trạng thái bgutil-pot — để lần sau biết lỗi là do video hay do PO-Token provider.
     """
+    cap = _WarnCapture()
+    pot = _pot.status()
     try:
         opts = _ytdl_opts(True, use_proxy=False)
         opts["extractor_args"]["youtube"] = {"player_client": ["web"], "skip": ["translated_subs", "comments"]}
         opts["ignore_no_formats_error"] = True
+        opts["no_warnings"] = False
+        opts["logger"] = cap
         info = await asyncio.wait_for(loop.run_in_executor(None, _extract_sync, opts, video_url), timeout=15.0)
     except Exception as exc:  # noqa: BLE001
-        return f"chẩn đoán lỗi: {str(exc)[:120]}", ""
+        return f"chẩn đoán lỗi: {str(exc)[:120]} | pot={pot} | warn={' / '.join(cap.msgs)[:200]}", ""
     fmts = info.get("formats") or []
     n_url = sum(1 for f in fmts if f.get("url"))
+    n_audio = sum(1 for f in fmts if f.get("url") and f.get("acodec") not in (None, "none"))
     avail, age, live = info.get("availability"), info.get("age_limit"), info.get("live_status")
-    summary = f"availability={avail} age_limit={age} live_status={live} formats={len(fmts)} có_url={n_url}"
+    warn = " / ".join(m.replace("\n", " ")[:140] for m in cap.msgs[:3])
+    summary = (f"availability={avail} age_limit={age} live_status={live} formats={len(fmts)} có_url={n_url} "
+               f"có_audio={n_audio} | pot={pot} | warn={warn or '-'}")
     hint = ""
     if (age or 0) >= 18 or avail == "needs_auth":
         hint = "Video giới hạn độ tuổi/cần đăng nhập — tài khoản dùng cho cookies phải là tài khoản đã xác minh 18+."
@@ -1164,8 +1207,8 @@ async def _diagnose_failure(video_url: str, loop: asyncio.AbstractEventLoop) -> 
         hint = "Video chỉ dành cho hội viên kênh/YouTube Premium."
     elif live in ("is_upcoming", "post_live"):
         hint = "Video là buổi phát trực tiếp chưa/vừa kết thúc nên chưa lấy được stream."
-    elif fmts and n_url == 0:
-        hint = "YouTube không đưa link stream trực tiếp (SABR) cho video này — thử bản upload khác."
+    elif fmts and n_audio == 0:
+        hint = "YouTube không đưa link stream âm thanh trực tiếp cho video này — thử bản upload khác."
     return summary, hint
 
 
