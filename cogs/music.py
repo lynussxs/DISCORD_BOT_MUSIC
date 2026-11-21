@@ -58,6 +58,7 @@ from discord.ext import commands
 
 import config
 from utils.logger import get_logger
+from utils import memstat as _mem
 from utils import pot_provider as _pot
 
 logger = get_logger(__name__)
@@ -985,8 +986,16 @@ _YT_STRATEGIES: list[dict[str, Any]] = [
 
 _RESOLVE_ATTEMPT_TIMEOUT = 20.0   # tối đa cho 1 lần extract — tránh 1 attempt treo ăn hết thời gian
 _RESOLVE_TOTAL_BUDGET    = 35.0   # tổng thời gian tối đa cho mọi chiến lược của 1 bài
+_MEM_PRESSURE_HEAL       = 0.75   # cgroup dùng ≥ 75% giới hạn → coi là áp lực bộ nhớ
 _RESOLVE_CACHE_TTL       = 300.0
 _RESOLVE_CACHE_MAX       = 64
+
+
+def _relieve_memory() -> str:
+    """Chạy trong executor: trả RAM rảnh của Python + restart bgutil-pot (V8 nhúng, hay ngốn RAM)."""
+    _mem.relieve()
+    _pot.restart_now("áp lực bộ nhớ")
+    return "mem-relieved"
 
 
 class _StrategyBreaker:
@@ -1052,10 +1061,19 @@ def _resolve_cache_get(video_url: str) -> tuple[dict[str, Any], bool, str | None
     return None
 
 
+_SLIM_KEYS = ("title", "url", "webpage_url", "thumbnail", "uploader", "channel", "duration", "id", "http_headers")
+
+
 def _resolve_cache_put(video_url: str, data: dict[str, Any], via_proxy: bool, proxy: str | None) -> None:
+    # Chỉ giữ các trường Track thực sự dùng. Dict gốc của yt-dlp có cả danh sách format/phụ đề/
+    # caption (hàng trăm KB mỗi bài) — giữ 64 bản trong RAM suốt đời process là lãng phí khi
+    # container bị giới hạn bộ nhớ và Deno cần chỗ để giải n-challenge.
+    now = time.monotonic()
+    for k in [k for k, v in _resolve_cache.items() if now - v[0] >= _RESOLVE_CACHE_TTL]:
+        _resolve_cache.pop(k, None)
     if len(_resolve_cache) >= _RESOLVE_CACHE_MAX:
         _resolve_cache.pop(min(_resolve_cache, key=lambda k: _resolve_cache[k][0]), None)
-    _resolve_cache[video_url] = (time.monotonic(), data, via_proxy, proxy)
+    _resolve_cache[video_url] = (now, {k: data[k] for k in _SLIM_KEYS if k in data}, via_proxy, proxy)
 
 
 _UNAVAILABLE_MARKERS = (
@@ -1078,6 +1096,7 @@ async def _resolve_stream(
     plan = _breaker.plan()
     last_err: Exception | None = None
     t_start = time.monotonic()
+    logger.info("MEM | %s", _mem.snapshot())
     # Chỉ "phạt" chiến lược trong breaker khi 1 chiến lược KHÁC cuối cùng thắng ở video đó.
     # Nếu mọi chiến lược đều fail thì lỗi nằm ở VIDEO (giới hạn tuổi, hội viên, bị gỡ...) chứ
     # không phải chiến lược hỏng — phạt lúc đó sẽ khoá oan cả 'web' đang chạy tốt với video khác.
@@ -1126,22 +1145,30 @@ async def _resolve_stream(
             if any(x in _low for x in _UNAVAILABLE_MARKERS) and "format" not in _low:
                 raise
 
-        # Nghi PO-Token hỏng: client web mất token → yt-dlp loại hết format https → "Requested
-        # format is not available" (hoặc "page needs to be reloaded" khi session cũ). Đúng kiểu lỗi
-        # "vài bài đầu ổn rồi mọi bài đều fail tới khi restart bot". Thử hồi phục provider (restart
-        # nếu chết/không ping, còn sống thì xoá cache token) rồi thử lại CHÍNH chiến lược này 1 lần.
+        # Lỗi kiểu "Requested format is not available"/"page needs to be reloaded" ở client web có
+        # cookies. Log thực tế (pot=ok, warn: 'Error running deno process (returncode: -9)') cho thấy
+        # nguyên nhân hay gặp là Deno — bộ giải n-challenge — bị SIGKILL từ ngoài (nghi OOM của
+        # container), KHÔNG phải PO-Token. Xử lý:
+        #   • RAM cgroup ≥ 75% → giải phóng (gc + malloc_trim + restart bgutil-pot) rồi thử lại web;
+        #   • còn lại → heal provider (restart nếu chết/không ping); xoá cache token KHÔNG thử lại
+        #     (log thực tế: xoá cache xong thử lại vẫn fail, chỉ tốn thêm ~5s).
         _el = err_str.lower()
         if (not healed and strat["cookies"] and not strat["proxy"]
                 and ("requested format is not available" in _el or "page needs to be reloaded" in _el)):
             healed = True
+            press = _mem.pressure()
+            snap = _mem.snapshot()
             try:
-                action = await asyncio.wait_for(
-                    loop.run_in_executor(None, _pot.heal, f"{strat['name']}: {err_str[:50]}"), timeout=20.0)
+                if press is not None and press >= _MEM_PRESSURE_HEAL:
+                    action = await asyncio.wait_for(loop.run_in_executor(None, _relieve_memory), timeout=25.0)
+                else:
+                    action = await asyncio.wait_for(
+                        loop.run_in_executor(None, _pot.heal, f"{strat['name']}: {err_str[:50]}"), timeout=20.0)
             except Exception as _he:  # noqa: BLE001
                 action = f"lỗi: {_he}"
-            logger.warning("POT HEAL | [%s] lỗi '%s' → %s (provider=%s)", strat["name"],
-                           err_str[:50].replace("\n", " "), action, _pot.status())
-            if action in ("restarted", "cache-cleared"):
+            logger.warning("HEAL | [%s] lỗi '%s' → %s | pot=%s | MEM %s", strat["name"],
+                           err_str[:50].replace("\n", " "), action, _pot.status(), snap)
+            if action in ("restarted", "mem-relieved"):
                 plan.insert(i + 1, strat)   # thử lại đúng chiến lược này; chưa tính là "fail" của nó
                 continue
 
@@ -1199,9 +1226,12 @@ async def _diagnose_failure(video_url: str, loop: asyncio.AbstractEventLoop) -> 
     avail, age, live = info.get("availability"), info.get("age_limit"), info.get("live_status")
     warn = " / ".join(m.replace("\n", " ")[:140] for m in cap.msgs[:3])
     summary = (f"availability={avail} age_limit={age} live_status={live} formats={len(fmts)} có_url={n_url} "
-               f"có_audio={n_audio} | pot={pot} | warn={warn or '-'}")
+               f"có_audio={n_audio} | pot={pot} | warn={warn or '-'} | MEM {_mem.snapshot()}")
+    deno_failed = any("n challenge solving failed" in m or "returncode: -9" in m for m in cap.msgs)
     hint = ""
-    if (age or 0) >= 18 or avail == "needs_auth":
+    if deno_failed and n_audio == 0:
+        hint = "Bộ giải mã chữ ký của bot (Deno) bị dừng giữa chừng (nghi thiếu RAM) — thử lại sau vài giây."
+    elif (age or 0) >= 18 or avail == "needs_auth":
         hint = "Video giới hạn độ tuổi/cần đăng nhập — tài khoản dùng cho cookies phải là tài khoản đã xác minh 18+."
     elif avail in ("subscriber_only", "premium_only"):
         hint = "Video chỉ dành cho hội viên kênh/YouTube Premium."

@@ -217,3 +217,8 @@ def heal(reason: str) -> str:
 
 def status() -> str:
     return provider.status() if provider else "n/a"
+
+
+def restart_now(reason: str) -> bool:
+    """Restart ngay (bỏ qua throttle) — dùng khi cần giải phóng RAM. False nếu chưa có provider."""
+    return provider.restart(reason) if provider else False

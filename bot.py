@@ -387,6 +387,8 @@ class MusicBot(commands.Bot):
             # Ghi version để biết Railway có đang chạy bản yt-dlp mới không (Docker layer
             # cache có thể giữ bản cũ → vẫn dính lỗi đã được vá, vd "page needs to be reloaded").
             logger.info("  📦  yt-dlp    : %s", yt_dlp.version.__version__)
+            from utils import memstat
+            logger.info("  🧠  Memory    : %s", memstat.snapshot())
         except Exception:
             pass
         logger.info(
@@ -458,6 +460,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # Trước khi tạo thread nào: giới hạn arena glibc để RSS của Python không phình dần.
+    from utils import memstat as _memstat
+    _memstat.limit_malloc_arenas()
     keep_alive()
     start_bgutil_provider()
     asyncio.run(main())
