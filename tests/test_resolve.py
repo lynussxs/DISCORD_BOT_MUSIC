@@ -541,3 +541,39 @@ def test_memstat_pressure_excludes_reclaimable_page_cache(monkeypatch):
     assert memstat.cgroup()["used"] == 497000000
     assert 0.38 < memstat.pressure() < 0.42                # ~207MB/488MB, không phải 97%
     assert "ws=" in memstat.snapshot()
+
+
+# ── Bỏ qua direct khi bị bot-check liên tiếp ───────────────────────────────────
+def test_skip_direct_after_streak_and_reprobe(monkeypatch):
+    b = m._breaker
+    assert not b.skip_direct()
+    for _ in range(3):
+        b.note_direct(True)
+    assert b.skip_direct()
+    b._direct_bc_at -= b.DIRECT_REPROBE + 1          # quá hạn → thăm dò lại direct
+    assert not b.skip_direct()
+    b.note_direct(True)
+    assert b.skip_direct()
+    b.note_direct(False)                              # direct thắng → reset
+    assert not b.skip_direct()
+
+
+def test_resolve_goes_straight_to_proxy_when_direct_blocked(monkeypatch):
+    for _ in range(3):
+        m._breaker.note_direct(True)
+    order = []
+
+    async def fake_race(opts, url, loop, t0):
+        order.append("proxy")
+        return {"url": "https://x/a", "title": "T", "id": "x" * 11}
+
+    def fake_extract(opts, url):
+        order.append("direct")
+        raise RuntimeError("never")
+
+    monkeypatch.setattr(m, "_proxy_race", fake_race)
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    async def go():
+        return await m._resolve_stream("https://www.youtube.com/watch?v=" + "k" * 11, asyncio.get_running_loop())
+    data, _, err = run(go())
+    assert data and err is None and order == ["proxy"]

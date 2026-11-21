@@ -1110,6 +1110,25 @@ class _StrategyBreaker:
         self._last_vid: dict[str, str] = {}
         self._until: dict[str, float] = {}
         self._ok_at: dict[str, float] = {}
+        self._direct_bc = 0          # số bài liên tiếp mà chiến lược trực tiếp bị bot-check
+        self._direct_bc_at = 0.0
+
+    # Khi IP Railway bị bot-check liên tiếp, bước thử vision (~1s) chỉ tốn thời gian rồi vẫn phải
+    # sang proxy. Sau DIRECT_SKIP_AFTER bài liên tiếp → đi thẳng proxy; thăm dò lại direct sau
+    # DIRECT_REPROBE giây (hoặc ngay khi 1 chiến lược trực tiếp thắng).
+    DIRECT_SKIP_AFTER = 3
+    DIRECT_REPROBE    = 300.0
+
+    def note_direct(self, botcheck: bool) -> None:
+        if botcheck:
+            self._direct_bc += 1
+            self._direct_bc_at = time.monotonic()
+        else:
+            self._direct_bc = 0
+
+    def skip_direct(self) -> bool:
+        return (self._direct_bc >= self.DIRECT_SKIP_AFTER
+                and time.monotonic() - self._direct_bc_at < self.DIRECT_REPROBE)
 
     def ok(self, name: str) -> None:
         self._fails[name] = 0
@@ -1368,6 +1387,14 @@ async def _resolve_stream(
     escalated = False   # chỉ nhảy sang proxy 1 lần/bài khi gặp bot-check
     bot_err: Exception | None = None   # lỗi bot-check đầu tiên — là NGUYÊN NHÂN THẬT, đừng để lỗi phụ ("page needs to be reloaded") che mất
 
+    if _breaker.skip_direct():
+        _pr = [s for s in plan if s["proxy"]]
+        if _pr:
+            plan = _pr + [s for s in plan if not s["proxy"]]
+            escalated = True
+            logger.info("RESOLVE | direct bị bot-check %d bài liên tiếp → đi thẳng proxy (thăm dò direct lại sau %.0fs)",
+                        _breaker._direct_bc, _breaker.DIRECT_REPROBE)
+
     i = -1
     while i + 1 < len(plan):
         i += 1
@@ -1404,6 +1431,8 @@ async def _resolve_stream(
                     timeout=_RESOLVE_ATTEMPT_TIMEOUT,
                 )
             _breaker.ok(strat["name"])
+            if not strat["proxy"]:
+                _breaker.note_direct(False)
             for _n in pending_fails:
                 _breaker.fail(_n, vid)
             logger.info("RESOLVE OK | [%s] %.1fs | %s%s", strat["name"], time.monotonic() - t0,
@@ -1466,6 +1495,7 @@ async def _resolve_stream(
                 if plan[_j]["proxy"] and plan[_j]["name"] not in skip_names:
                     plan.insert(i + 1, plan.pop(_j))
                     escalated = True
+                    _breaker.note_direct(True)
                     logger.info("RESOLVE | bot-check ở [%s] → nhảy thẳng sang proxy", strat["name"])
                     break
         if strat["proxy"] and "sign in to confirm" in err_str.lower():
