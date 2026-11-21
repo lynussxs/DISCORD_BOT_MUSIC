@@ -1121,6 +1121,7 @@ async def _resolve_stream(
         logger.info("Client rotation | attempt %d/%d [%s] → %s (proxy=%s)", i + 1, len(plan),
                     strat["name"], strat["clients"], "yes" if opts.get("proxy") else "no")
         t0 = time.monotonic()
+        oom0 = (_mem.cgroup().get("oom_kill") or 0)
         try:
             data = await asyncio.wait_for(
                 loop.run_in_executor(None, _extract_sync, opts, video_url),
@@ -1158,16 +1159,18 @@ async def _resolve_stream(
             healed = True
             press = _mem.pressure()
             snap = _mem.snapshot()
+            # Đo lúc lỗi thì Deno đã chết nên cgroup trông "rảnh"; dấu hiệu chắc chắn là oom_kill tăng.
+            oom_hit = (_mem.cgroup().get("oom_kill") or 0) > oom0
             try:
-                if press is not None and press >= _MEM_PRESSURE_HEAL:
+                if oom_hit or (press is not None and press >= _MEM_PRESSURE_HEAL):
                     action = await asyncio.wait_for(loop.run_in_executor(None, _relieve_memory), timeout=25.0)
                 else:
                     action = await asyncio.wait_for(
                         loop.run_in_executor(None, _pot.heal, f"{strat['name']}: {err_str[:50]}"), timeout=20.0)
             except Exception as _he:  # noqa: BLE001
                 action = f"lỗi: {_he}"
-            logger.warning("HEAL | [%s] lỗi '%s' → %s | pot=%s | MEM %s", strat["name"],
-                           err_str[:50].replace("\n", " "), action, _pot.status(), snap)
+            logger.warning("HEAL | [%s] lỗi '%s' → %s | oom_hit=%s | pot=%s | MEM %s", strat["name"],
+                           err_str[:50].replace("\n", " "), action, oom_hit, _pot.status(), snap)
             if action in ("restarted", "mem-relieved"):
                 plan.insert(i + 1, strat)   # thử lại đúng chiến lược này; chưa tính là "fail" của nó
                 continue

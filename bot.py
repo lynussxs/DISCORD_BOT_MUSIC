@@ -463,6 +463,9 @@ if __name__ == "__main__":
     # Trước khi tạo thread nào: giới hạn arena glibc để RSS của Python không phình dần.
     from utils import memstat as _memstat
     _memstat.limit_malloc_arenas()
+    # Deno (n-challenge) bị OOM-kill ở container ~488MB: ép heap V8 nhỏ để nó GC sớm thay vì phình
+    # tới trần cgroup. yt-dlp truyền nguyên env cho Deno. Ghi đè được bằng biến DENO_V8_FLAGS.
+    os.environ.setdefault("DENO_V8_FLAGS", "--max-old-space-size=96,--max-semi-space-size=4")
     keep_alive()
     start_bgutil_provider()
     asyncio.run(main())
