@@ -59,7 +59,9 @@ def test_plan_default_order_and_single_proxy_attempt():
     names = [s["name"] for s in m._breaker.plan()]
     assert names[0] == "vision"          # log 21/11: chỉ visionos thắng (không cookies/PO-Token/Deno)
     assert names.index("web") > names.index("samsung_ck")   # web (SABR, tốn RAM) không đứng đầu
-    assert names.count("proxy") == 1 and names[-1] == "proxy"
+    assert names.count("proxy") == 1
+    # web/web_nock ("late") chỉ chạy SAU proxy: chưa thắng lần nào, lại làm RAM vọt
+    assert names.index("proxy") < names.index("web") and names.index("proxy") < names.index("web_nock")
 
 
 def test_plan_promotes_recent_winner():
@@ -70,7 +72,7 @@ def test_plan_promotes_recent_winner():
 def test_plan_demotes_cookie_strategies_when_cookies_invalid(monkeypatch):
     monkeypatch.setattr(m, "_cookies_valid", lambda: False)
     plan = m._breaker.plan()
-    firsts = [s for s in plan[:3]]
+    firsts = [s for s in plan[:2]]
     assert all(not s["cookies"] for s in firsts)
 
 
@@ -305,3 +307,37 @@ def test_prewarm_is_reused_and_discarded(monkeypatch):
         t.discard_prewarm()
         assert cleaned == [1]                               # nguồn dựng sẵn bị dọn, không rò ffmpeg
     run(go())
+
+
+# ── Bot-check ở chiến lược trực tiếp → nhảy thẳng sang proxy (log 5GG_MkQYQq0 / qe7stKL5qco) ──
+def test_botcheck_on_direct_jumps_straight_to_proxy(monkeypatch):
+    calls = []
+    def fake_extract(opts, url):
+        clients = opts["extractor_args"]["youtube"]["player_client"]
+        calls.append(clients)
+        if len(clients) == 4:                      # chiến lược proxy
+            return {"url": "https://x/a", "title": "t", "duration": 100}
+        raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot.")
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    async def go():
+        return await m._resolve_stream("https://www.youtube.com/watch?v=" + "y" * 11, asyncio.get_running_loop())
+    data, proxy, err = run(go())
+    assert data and err is None
+    assert calls == [["visionos"], ["tv_samsung", "visionos", "web_embedded", "android_vr"]]   # 2 lần, không 7
+
+
+def test_botcheck_then_proxy_fail_continues_with_remaining(monkeypatch):
+    calls = []
+    def fake_extract(opts, url):
+        clients = opts["extractor_args"]["youtube"]["player_client"]
+        calls.append(clients)
+        if clients == ["tv_samsung"]:
+            return {"url": "https://x/a", "title": "t", "duration": 100}
+        raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot.")
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    async def go():
+        return await m._resolve_stream("https://www.youtube.com/watch?v=" + "z" * 11, asyncio.get_running_loop())
+    data, proxy, err = run(go())
+    assert data                                    # proxy hỏng → vẫn thử tiếp samsung_ck và thắng
+    assert calls[1] and len(calls[1]) == 4         # nhảy proxy ngay sau vision
+    assert ["tv_samsung"] in calls

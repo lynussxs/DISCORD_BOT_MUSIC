@@ -986,8 +986,10 @@ _YT_STRATEGIES: list[dict[str, Any]] = [
     {"name": "samsung_ck", "clients": ["tv_samsung"],                    "cookies": True,  "proxy": False},
     {"name": "embed_vr",   "clients": ["web_embedded", "android_vr"],     "cookies": False, "proxy": False},
     {"name": "tv_dg_ck",   "clients": ["tv_downgraded"],                  "cookies": True,  "proxy": False},
-    {"name": "web",        "clients": ["web", "mweb"],                    "cookies": True,  "proxy": False},
-    {"name": "web_nock",   "clients": ["web", "mweb"],                    "cookies": False, "proxy": False},
+    # 'late' = chỉ thử SAU proxy. Log 21/11 (nhiều video): web luôn "Requested format is not available"
+    # (SABR), web_nock luôn bot-check, chưa thắng lần nào; web còn tốn ~5s + làm RAM cgroup vọt lên 70-80%.
+    {"name": "web",        "clients": ["web", "mweb"],                    "cookies": True,  "proxy": False, "late": True},
+    {"name": "web_nock",   "clients": ["web", "mweb"],                    "cookies": False, "proxy": False, "late": True},
     {"name": "proxy",      "clients": ["tv_samsung", "visionos", "web_embedded", "android_vr"], "cookies": False, "proxy": True},
 ]
 
@@ -1109,7 +1111,9 @@ class _StrategyBreaker:
         # Proxy datacenter hầu như luôn dính bot-check → chỉ thử 1 lần/bài, và bỏ qua khi breaker đã khoá.
         live_proxies = [s for s in proxies if not self.tripped(s["name"])]
         dead += [s for s in proxies if self.tripped(s["name"])]
-        return alive + live_proxies + dead
+        main = [s for s in alive if not s.get("late")]
+        late = [s for s in alive if s.get("late")]
+        return main + live_proxies + late + dead
 
 
 _breaker = _StrategyBreaker()
@@ -1167,6 +1171,7 @@ async def _resolve_stream(
     pending_fails: list[str] = []
     skip_names: set[str] = set()
     healed = False      # chỉ tự hồi phục PO-Token provider 1 lần cho mỗi bài
+    escalated = False   # chỉ nhảy sang proxy 1 lần/bài khi gặp bot-check
 
     i = -1
     while i + 1 < len(plan):
@@ -1242,6 +1247,17 @@ async def _resolve_stream(
                 continue
 
         pending_fails.append(strat["name"])
+        # Bot-check ("Sign in to confirm...") khi đi thẳng từ IP Railway: log 5GG_MkQYQq0 & qe7stKL5qco
+        # cho thấy mọi chiến lược trực tiếp còn lại đều fail y hệt (~13s) rồi proxy mới thắng → nhảy
+        # thẳng sang proxy (1 lần/bài), các chiến lược trực tiếp còn lại thử sau nếu proxy cũng hỏng.
+        if (not strat["proxy"] and not escalated and "sign in to confirm" in err_str.lower()
+                and "sign in to confirm" in _el):
+            for _j in range(i + 2, len(plan)):
+                if plan[_j]["proxy"] and plan[_j]["name"] not in skip_names:
+                    plan.insert(i + 1, plan.pop(_j))
+                    escalated = True
+                    logger.info("RESOLVE | bot-check ở [%s] → nhảy thẳng sang proxy", strat["name"])
+                    break
         if strat["proxy"] and "sign in to confirm" in err_str.lower():
             skip_names.add(strat["name"])   # bot-check qua proxy → proxy thứ 2 cũng IP datacenter, khỏi tốn thêm ~8s
         current = opts.get("proxy", "")
