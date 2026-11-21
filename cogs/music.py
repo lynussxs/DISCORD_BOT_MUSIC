@@ -72,49 +72,30 @@ COLOUR_SUCCESS = 0x57F287   # mint
 
 # ── Webshare Proxy Manager ─────────────────────────────────────────────────────
 
+# Chỉ IP:port (không có mật khẩu) — mật khẩu lấy từ biến môi trường WEBSHARE_CRED.
+_WS_CRED_ENV = os.environ.get("WEBSHARE_CRED", "").strip()
+_WS_HOSTS = [
+    "31.56.127.193:7684", "198.23.243.226:6361", "38.154.185.97:6370", "191.96.254.138:6185",
+    "142.111.67.146:5611", "31.59.20.176:6754", "45.38.107.97:6014", "198.105.121.200:6462",
+    "64.137.96.74:6641", "84.247.60.125:6095",
+]
+
+
 class WebshareProxyManager:
     """Proxy manager: Bright Data residential (ưu tiên cao nhất) → US → Japan → free datacenter."""
 
     # US proxy để bypass video chỉ cho Mỹ xem. Set env var PROXY_US=http://user:pass@host:port
     PROXY_US = os.environ.get("PROXY_US", "")
 
-    # Bright Data residential (freemium) — IP nhà dân thật, không nằm trong blocklist
-    # công khai như datacenter/free proxy. Ưu tiên CAO NHẤT vì chất lượng tốt nhất.
-    #
-    # QUAN TRỌNG: gói "freemium" có vẻ KHÔNG cho phép thêm hậu tố tùy chỉnh nào
-    # (kể cả -session-, -ip-, -country-) — mọi hậu tố đều bị từ chối 403. Dùng
-    # ĐÚNG Y HỆT credentials cơ bản như dashboard Bright Data hiển thị, không
-    # thêm gì cả. IP residential sẽ được họ tự động xoay vòng ngẫu nhiên.
-    _BRD_CRED = "c7593mkpjov5"
-    _BRD_CUSTOMER = "brd-customer-hl_3fb760f0-zone-freemium"
-    BRIGHTDATA_RESIDENTIAL = [
-        f"http://{_BRD_CUSTOMER}:{_BRD_CRED}@brd.superproxy.io:33335",
-    ]
-
-    # Webshare auth proxies — 10 proxy cố định của gói free, đã TEST THẬT bằng
-    # curl + ip-api.com ngày 16/08/2026, xác nhận còn sống + đúng quốc gia ghi
-    # chú (không phải đoán mò như phần free public bên dưới).
-    _WS_CRED = "fywznozi:gv94cmc9t7qs"
-    WEBSHARE_10 = [
-        f"http://{_WS_CRED}@31.56.127.193:7684",    # US — Seattle, WA
-        f"http://{_WS_CRED}@198.23.243.226:6361",   # US — Los Angeles, CA
-        f"http://{_WS_CRED}@38.154.185.97:6370",    # US — Piscataway, NJ
-        f"http://{_WS_CRED}@191.96.254.138:6185",   # US — Los Angeles, CA
-        f"http://{_WS_CRED}@142.111.67.146:5611",   # JP — Ueda, Nagano
-        f"http://{_WS_CRED}@31.59.20.176:6754",     # GB — London
-        f"http://{_WS_CRED}@45.38.107.97:6014",     # GB — London
-        f"http://{_WS_CRED}@198.105.121.200:6462",  # GB — Canary Wharf
-        f"http://{_WS_CRED}@64.137.96.74:6641",     # ES — Madrid
-        f"http://{_WS_CRED}@84.247.60.125:6095",    # PL — Warsaw
-    ]
+    # Credentials proxy KHÔNG còn nằm trong source (repo công khai!). Đặt trên Railway:
+    #   WEBSHARE_API_KEY  — bot tự lấy danh sách proxy + credentials HIỆN TẠI qua API (khuyên dùng)
+    #   WEBSHARE_CRED     — "user:pass" dùng chung cho danh sách IP cố định bên dưới (tuỳ chọn)
+    #   PROXY_US          — http://user:pass@host:port (proxy Mỹ, tuỳ chọn)
+    WEBSHARE_10 = [f"http://{_WS_CRED_ENV}@{_hp}" for _hp in _WS_HOSTS] if _WS_CRED_ENV else []
 
     # Public free proxies (fallback cuối — không auth, dễ chết, CHƯA kiểm
     # chứng như WEBSHARE_10 ở trên, chỉ dùng khi mọi proxy có auth đều fail)
     PRIORITY = [
-        # BRIGHTDATA_RESIDENTIAL rút khỏi vòng xoay LẦN 2 — đã test lại, vẫn 403
-        # dù Playground báo OK + IP đã whitelist. Xác nhận lỗi hạ tầng phía họ.
-        # Cần liên hệ support Bright Data xác nhận zone đã fix trước khi bật lại.
-        # *BRIGHTDATA_RESIDENTIAL,
         *([ PROXY_US ] if PROXY_US else []),
         *WEBSHARE_10,
         # Germany proxy đã bỏ — 31.58.9.4:6077 luôn 407 (credentials chết), gây lãng phí 1 attempt mỗi lần
@@ -272,6 +253,12 @@ _proxy = WebshareProxyManager()
 
 # ── yt-dlp options ─────────────────────────────────────────────────────────────
 
+# Ưu tiên audio-only. Khi YouTube ép SABR chỉ còn định dạng có kèm video, chọn bản NHỎ NHẤT có
+# tiếng (18=360p mp4 ~96k, 93/94=HLS 360p/480p, 92/91=HLS 240p/144p) thay vì "best" (có thể là
+# 1080p — ffmpeg vẫn phải tải cả phần video dù có -vn, rất tốn băng thông/RAM trên gói free).
+_YT_FORMAT = "bestaudio/18/93/94/92/91/best[height<=480]/best"
+
+
 def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     # tv_embedded/android_vr được thiết kế để BYPASS auth — nếu gửi kèm cookies,
     # YouTube trả về format list rỗng/hạn chế → "Requested format is not available".
@@ -279,10 +266,10 @@ def _ytdl_opts(cookies: bool = True, use_proxy: bool = True) -> dict[str, Any]:
     # Thêm "tv" — hiện là 1 trong các client MẶC ĐỊNH của chính yt-dlp (cùng
     # ios/web) từ giữa 2025, khá bền với PO-Token so với mweb/web đơn thuần.
     cookie_file_exists = cookies and _cookies_valid()
-    player_clients = ["tv", "web", "android", "ios"] if cookie_file_exists else ["tv", "tv_embedded", "ios", "android_vr"]
+    player_clients = ["tv_samsung", "web_embedded", "web"] if cookie_file_exists else ["tv_samsung", "visionos", "web"]
 
     opts: dict[str, Any] = {
-        "format"          : "bestaudio/best/18/140/251",  # 18=progressive mp4, 140=m4a, 251=opus — fallback tường minh khi bestaudio selector không match được (client trả format thiếu tag acodec/vcodec)
+        "format"          : _YT_FORMAT,  # 18=progressive mp4, 140=m4a, 251=opus — fallback tường minh khi bestaudio selector không match được (client trả format thiếu tag acodec/vcodec)
         # Ưu tiên định dạng HLS (m3u8, tv_embedded trả về loại này) hơn DASH/
         # progressive thường — HLS hiện CHƯA bị YouTube bắt buộc PO-Token,
         # trong khi non-HLS âm thanh (itag 251/140 từ android/android_vr) thì
@@ -970,22 +957,27 @@ def _log_ffmpeg_stderr(source: Any) -> str:
 # (half-open); fail tiếp là khoá lại ngay.
 
 _YT_STRATEGIES: list[dict[str, Any]] = [
-    # Thứ tự TĨNH theo kết quả log thực tế (11:19-11:44): 'web' (cookies) thành công ở hầu hết video;
-    # 'embed_vr' cứu được video mà web trả "Requested format is not available" (nhưng URL android_vr
-    # hay 403 lần đầu → player tự refresh); tv/tv_ck/ios chưa lần nào thắng nên xếp sau. safari_ck đã
-    # bỏ: 2/2 lần fail đúng như web ("Requested format...") mà tốn ~4.5s mỗi lần.
-    {"name": "web",       "clients": ["web", "mweb"],                      "cookies": True,  "proxy": False},
-    # web_embedded + android_vr: theo PO Token Guide của yt-dlp, 2 client này (cùng "tv")
-    # là nhóm duy nhất không đòi PO Token — thử riêng để không "giành format" với nhau.
-    {"name": "embed_vr",  "clients": ["web_embedded", "android_vr"],       "cookies": False, "proxy": False},
-    {"name": "tv_ck",     "clients": ["tv"],                               "cookies": True,  "proxy": False},
-    {"name": "tv",        "clients": ["tv_embedded", "tv"],                "cookies": False, "proxy": False},
-    {"name": "ios",       "clients": ["ios"],                              "cookies": False, "proxy": False},
-    {"name": "proxy",     "clients": ["tv_embedded", "tv", "android", "android_vr"], "cookies": False, "proxy": True},
+    # CẬP NHẬT 21/11/2026 theo source yt-dlp 2026.10.26 (INNERTUBE_CLIENTS) + log thực tế:
+    #  • 'tv_embedded' và 'android' KHÔNG còn tồn tại trong yt-dlp → bị bỏ qua âm thầm, các chiến
+    #    lược cũ chỉ còn 1 client thật. Client MẶC ĐỊNH hiện tại của yt-dlp là tv_samsung/visionos/web
+    #    (có đăng nhập: web_embedded/tv_samsung/web) — bot chưa từng thử tv_samsung & visionos.
+    #  • tv_samsung / tv_downgraded / web_embedded / visionos KHÔNG đòi GVS PO-Token (web/mweb/ios/
+    #    android_vr thì đòi). Khi YouTube bật thí nghiệm "SABR-only" cho session/tài khoản
+    #    ("Some web client https formats have been skipped… forcing SABR streaming"), web/mweb chỉ
+    #    còn storyboard → "Requested format is not available"; các client TV vẫn trả link thẳng.
+    #  • Client có hỗ trợ cookies mà gửi kèm cookies thì client KHÔNG hỗ trợ (visionos, android_vr,
+    #    ios) bị yt-dlp bỏ qua → tách riêng strategy có cookies / không cookies.
+    {"name": "samsung_ck", "clients": ["tv_samsung"],                    "cookies": True,  "proxy": False},
+    {"name": "web",        "clients": ["web", "mweb"],                    "cookies": True,  "proxy": False},
+    {"name": "vision",     "clients": ["visionos"],                       "cookies": False, "proxy": False},
+    {"name": "embed_vr",   "clients": ["web_embedded", "android_vr"],     "cookies": False, "proxy": False},
+    {"name": "tv_dg_ck",   "clients": ["tv_downgraded"],                  "cookies": True,  "proxy": False},
+    {"name": "web_nock",   "clients": ["web", "mweb"],                    "cookies": False, "proxy": False},
+    {"name": "proxy",      "clients": ["tv_samsung", "visionos", "web_embedded", "android_vr"], "cookies": False, "proxy": True},
 ]
 
-_RESOLVE_ATTEMPT_TIMEOUT = 20.0   # tối đa cho 1 lần extract — tránh 1 attempt treo ăn hết thời gian
-_RESOLVE_TOTAL_BUDGET    = 35.0   # tổng thời gian tối đa cho mọi chiến lược của 1 bài
+_RESOLVE_ATTEMPT_TIMEOUT = 15.0   # tối đa cho 1 lần extract — tránh 1 attempt treo ăn hết thời gian
+_RESOLVE_TOTAL_BUDGET    = 25.0   # tổng thời gian tối đa cho mọi chiến lược của 1 bài
 _MEM_PRESSURE_HEAL       = 0.75   # cgroup dùng ≥ 75% giới hạn → coi là áp lực bộ nhớ
 _RESOLVE_CACHE_TTL       = 300.0
 _RESOLVE_CACHE_MAX       = 64
@@ -1043,9 +1035,20 @@ class _StrategyBreaker:
         # bằng embed_vr không có nghĩa web hỏng. Chỉ đẩy chiến lược dùng cookies xuống cuối khi
         # cookies.txt không hợp lệ (gửi cookies rác vô ích).
         cookies_ok = _cookies_valid()
-        alive.sort(key=lambda s: 1 if (s["cookies"] and not cookies_ok) else 0)
-        # Chiến lược proxy thử 2 lần (lần fail đầu mark_dead proxy đó → lần 2 dùng proxy khác).
-        return alive + proxies * 2 + dead
+        now = time.monotonic()
+        order = {s["name"]: i for i, s in enumerate(_YT_STRATEGIES)}
+        def _key(s: dict[str, Any]) -> tuple[int, int, float, int]:
+            no_ck = 1 if (s["cookies"] and not cookies_ok) else 0
+            # Chiến lược vừa thắng trong 20 phút qua → thử TRƯỚC (thí nghiệm SABR của YouTube theo
+            # session/tài khoản, không theo video: thắng gần đây = khả năng cao thắng tiếp).
+            ok_at = self._ok_at.get(s["name"], 0.0)
+            recent = 0 if (ok_at and now - ok_at < 1200.0) else 1
+            return (no_ck, recent, -ok_at if recent == 0 else 0.0, order[s["name"]])
+        alive.sort(key=_key)
+        # Proxy datacenter hầu như luôn dính bot-check → chỉ thử 1 lần/bài, và bỏ qua khi breaker đã khoá.
+        live_proxies = [s for s in proxies if not self.tripped(s["name"])]
+        dead += [s for s in proxies if self.tripped(s["name"])]
+        return alive + live_proxies + dead
 
 
 _breaker = _StrategyBreaker()
@@ -1154,7 +1157,9 @@ async def _resolve_stream(
         #   • còn lại → heal provider (restart nếu chết/không ping); xoá cache token KHÔNG thử lại
         #     (log thực tế: xoá cache xong thử lại vẫn fail, chỉ tốn thêm ~5s).
         _el = err_str.lower()
-        if (not healed and strat["cookies"] and not strat["proxy"]
+        # Chỉ 'web' phụ thuộc PO-Token provider (bgutil-pot); các client TV không cần PO-Token nên
+        # restart provider khi chúng fail là vô ích (log 21/11: pot=ok, oom_kill=0, lỗi do SABR).
+        if (not healed and strat["name"] == "web"
                 and ("requested format is not available" in _el or "page needs to be reloaded" in _el)):
             healed = True
             press = _mem.pressure()
@@ -1228,9 +1233,13 @@ async def _diagnose_failure(video_url: str, loop: asyncio.AbstractEventLoop) -> 
         opts["no_warnings"] = False
         opts["verbose"] = True   # để logger nhận cả dòng debug (PO token/jsc/cookies) — chỉ dùng cho chẩn đoán
         opts["logger"] = cap
-        info = await asyncio.wait_for(loop.run_in_executor(None, _extract_sync, opts, video_url), timeout=15.0)
+        info = await asyncio.wait_for(loop.run_in_executor(None, _extract_sync, opts, video_url), timeout=10.0)
     except Exception as exc:  # noqa: BLE001
         return f"chẩn đoán lỗi: {str(exc)[:120]} | pot={pot} | warn={' / '.join(cap.msgs)[:200]}", ""
+    _diag_meta[video_url] = {"title": info.get("title") or "", "duration": info.get("duration"),
+                             "uploader": info.get("uploader") or info.get("channel") or ""}
+    if len(_diag_meta) > 64:
+        _diag_meta.pop(next(iter(_diag_meta)), None)
     fmts = info.get("formats") or []
     n_url = sum(1 for f in fmts if f.get("url"))
     n_audio = sum(1 for f in fmts if f.get("url") and f.get("acodec") not in (None, "none"))
@@ -1347,6 +1356,94 @@ _PREBUFFER_TIMEOUT = 12.0
 PIPED_FIRST = os.environ.get("PIPED_FIRST", "0") == "1"
 
 
+# ── Fallback cuối: SoundCloud ──────────────────────────────────────────────────
+# Khi MỌI chiến lược YouTube đều fail (IP datacenter bị bot-check / tài khoản dính thí nghiệm SABR),
+# tìm đúng bài trên SoundCloud (không có bot-check kiểu YouTube, yt-dlp hỗ trợ sẵn). Chỉ nhận kết quả
+# khi tên bài khớp VÀ độ dài lệch ít (tránh nhầm bản remix/preview 30s). Tắt bằng SC_FALLBACK=0.
+_SC_ENABLED = os.environ.get("SC_FALLBACK", "1").strip() != "0"
+_SC_STOPWORDS = frozenset({
+    "official", "video", "audio", "lyrics", "lyric", "mv", "hd", "4k", "hq", "visualizer",
+    "topic", "vevo", "ft", "feat", "featuring", "music", "the", "a", "of", "and", "full", "song",
+})
+_diag_meta: dict[str, dict[str, Any]] = {}   # video_url → {title, duration, uploader} (từ _diagnose_failure)
+
+
+def _title_tokens(text: str) -> list[str]:
+    return [t for t in re.findall(r"\w+", (text or "").lower()) if len(t) > 1 and t not in _SC_STOPWORDS]
+
+
+def _sc_pick(entries: list[dict[str, Any]], title: str, duration: int | float | None) -> dict[str, Any] | None:
+    """Chọn kết quả SoundCloud khớp nhất; None nếu không đủ tin cậy."""
+    want = set(_title_tokens(title))
+    if not want:
+        return None
+    best: tuple[float, dict[str, Any]] | None = None
+    for e in entries:
+        if not e or not e.get("url"):
+            continue
+        have = set(_title_tokens(e.get("title", "")) + _title_tokens(e.get("uploader", "")))
+        overlap = len(want & have) / len(want)
+        if overlap < 0.6:
+            continue
+        cd = e.get("duration")
+        bonus = 0.0
+        if duration and cd:
+            diff = abs(float(duration) - float(cd))
+            if diff > max(8.0, 0.06 * float(duration)):
+                continue            # khác độ dài đáng kể → bản khác/preview
+            bonus = 0.3 * (1.0 - min(diff / 10.0, 1.0))
+        elif cd and cd < 60:
+            continue                # không biết độ dài YouTube: loại bản preview ngắn
+        score = overlap + bonus
+        if best is None or score > best[0]:
+            best = (score, e)
+    return best[1] if best else None
+
+
+async def _yt_oembed_title(video_url: str) -> str:
+    """Tên video qua oEmbed (không cần đăng nhập, ít bị bot-check) — dùng khi không có metadata nào khác."""
+    try:
+        async with _httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(
+                "https://www.youtube.com/oembed", params={"url": video_url, "format": "json"})
+        if r.status_code == 200:
+            return str(r.json().get("title") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+async def _soundcloud_resolve(
+    title: str, duration: int | float | None, loop: asyncio.AbstractEventLoop,
+) -> dict[str, Any] | None:
+    if not _SC_ENABLED or not title:
+        return None
+    t0 = time.monotonic()
+    try:
+        q = " ".join(_title_tokens(title))[:80] or title[:80]
+        s_opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "socket_timeout": 8}
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, _extract_sync, s_opts, f"scsearch8:{q}"), timeout=10.0)
+        pick = _sc_pick([e for e in (info.get("entries") or []) if e], title, duration)
+        if not pick:
+            logger.info("SC FALLBACK | không có kết quả khớp cho '%s'", title[:60])
+            return None
+        d_opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 8,
+                  "format": "bestaudio/best"}
+        data = await asyncio.wait_for(
+            loop.run_in_executor(None, _extract_sync, d_opts, pick["url"]), timeout=12.0)
+        if not data.get("url"):
+            return None
+        data["uploader"] = f"{data.get('uploader') or data.get('channel') or '?'} · SoundCloud"
+        data["_source"] = "soundcloud"
+        logger.info("SC FALLBACK OK | '%s' → '%s' (%.1fs)", title[:50], str(data.get("title"))[:50],
+                    time.monotonic() - t0)
+        return data
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SC FALLBACK lỗi: %s", str(exc)[:120])
+        return None
+
+
 class Track:
     """Metadata + streaming URL for one song, resolved by yt-dlp."""
 
@@ -1406,6 +1503,7 @@ class Track:
         # confirm..." ngay lập tức mà log không hề thấy dòng "Client rotation".
         yt_id_re = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})")
         yt_match = yt_id_re.search(query)
+        yt_meta: dict[str, Any] = {}   # title/duration của kết quả search (nếu có) — cho SC fallback
 
         if yt_match:
             video_url = f"https://www.youtube.com/watch?v={yt_match.group(1)}"
@@ -1419,6 +1517,7 @@ class Track:
             _sc = _search_cache.get(resolved)
             if _sc and (time.monotonic() - _sc[0]) < 600:
                 video_url = _sc[1]   # đã tìm query này gần đây → khỏi gọi search lần nữa
+                yt_meta = {"title": query}
             else:
                 try:
                     search_opts = {
@@ -1437,6 +1536,7 @@ class Track:
                         if not entries:
                             raise ValueError(f"No results found for: {query}")
                         entry = entries[0]
+                        yt_meta = {"title": entry.get("title") or query, "duration": entry.get("duration")}
                         video_url = (entry.get("url") or entry.get("webpage_url")
                                      or f"https://www.youtube.com/watch?v={entry['id']}")
                     else:
@@ -1461,21 +1561,27 @@ class Track:
         resolved_via_proxy = bool(resolved_proxy_str)
 
         if data is None:
-            # ── Mọi client/proxy đều fail → thử Piped API làm phương án cuối ──
+            # ── Mọi chiến lược YouTube đều fail ──
+            # (1) Chẩn đoán (cũng lấy title/duration cho bước SoundCloud).
+            summary, hint = await _diagnose_failure(video_url, loop)
+            logger.warning("DIAG | %s | %s", video_url, summary)
+            # (2) SoundCloud: đúng bài + đúng độ dài thì phát luôn, người dùng khỏi phải thử lại.
+            meta = {**_diag_meta.pop(video_url, {}), **{k: v for k, v in yt_meta.items() if v}}
+            sc_title = meta.get("title") or await _yt_oembed_title(video_url)
+            sc_data = await _soundcloud_resolve(sc_title, meta.get("duration"), loop)
+            if sc_data:
+                _resolve_cache_put(video_url, sc_data, False, None)
+                return cls(sc_data, requester, via_proxy=False)
+            # (3) Piped/Invidious công khai gần như đã chết hoàn toàn (log 21/11: 404/500/502) →
+            #     mặc định bỏ qua để khỏi tốn thêm ~8s; bật lại bằng PIPED_FALLBACK=1.
             vid_match = re.search(r"(?:v=|/)([\w-]{11})(?:[&?/]|$)", video_url)
-            if vid_match:
-                logger.warning("yt-dlp exhausted, trying Piped fallback for %s…", vid_match.group(1))
-                # Giới hạn 8s: log thực tế instance Piped/Invidious công cộng đều 502/403/530,
-                # trước đây việc dò chúng tốn thêm ~14s trước khi báo lỗi.
+            if vid_match and os.environ.get("PIPED_FALLBACK", "0") == "1":
                 try:
                     piped_data = await asyncio.wait_for(_piped_fallback(vid_match.group(1), loop), timeout=8.0)
                 except asyncio.TimeoutError:
                     piped_data = None
                 if piped_data:
-                    # Piped/Invidious tự phục vụ URL của họ, không qua proxy Bright Data/Webshare
                     return cls(piped_data, requester, via_proxy=False)
-            summary, hint = await _diagnose_failure(video_url, loop)
-            logger.warning("DIAG | %s | %s", video_url, summary)
             if last_err is not None:
                 last_err._diag_hint = hint  # type: ignore[attr-defined]
             # Để lỗi gốc của yt-dlp hiện ra (chính xác hơn việc tự đoán nguyên nhân).
@@ -1542,9 +1648,11 @@ class Track:
                 # bài vừa fail vì 403/PO-Token (như android_vr itag 251), thử
                 # lại đúng client cũ chỉ fail y hệt lần nữa — đổi sang
                 # tv_embedded trước mới có cơ hội thoát khỏi vòng lặp 403.
-                opts = _ytdl_opts(cookies=False, use_proxy=use_proxy)
+                _ck = _cookies_valid() and not use_proxy
+                opts = _ytdl_opts(cookies=_ck, use_proxy=use_proxy)
                 opts["extractor_args"] = {
-                    "youtube": {"player_client": ["tv_embedded", "tv", "android", "android_vr"],
+                    "youtube": {"player_client": (["tv_samsung", "web_embedded"] if _ck
+                                                  else ["tv_samsung", "visionos", "web_embedded", "android_vr"]),
                                 "skip": ["translated_subs", "comments"]},
                     "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
                 }
