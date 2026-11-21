@@ -1197,9 +1197,16 @@ async def _resolve_stream(
 
 class _WarnCapture:
     """Logger giả cho yt-dlp: gom warning/error để đưa vào log chẩn đoán (opts mặc định tắt hết)."""
+    _DBG_KEYS = ("pot", "po token", "n challenge", "jsc", "sabr", "cookie", "login", "skipping",
+                 "client", "player", "signature", "deno", "visitor", "logged")
+
     def __init__(self) -> None:
         self.msgs: list[str] = []
-    def debug(self, msg: str) -> None: pass
+        self.dbg: list[str] = []
+    def debug(self, msg: str) -> None:
+        m = str(msg)
+        if len(self.dbg) < 14 and any(k in m.lower() for k in self._DBG_KEYS):
+            self.dbg.append(m[:140])
     def info(self, msg: str) -> None: pass
     def warning(self, msg: str) -> None: self.msgs.append(str(msg))
     def error(self, msg: str) -> None: self.msgs.append(str(msg))
@@ -1219,6 +1226,7 @@ async def _diagnose_failure(video_url: str, loop: asyncio.AbstractEventLoop) -> 
         opts["extractor_args"]["youtube"] = {"player_client": ["web"], "skip": ["translated_subs", "comments"]}
         opts["ignore_no_formats_error"] = True
         opts["no_warnings"] = False
+        opts["verbose"] = True   # để logger nhận cả dòng debug (PO token/jsc/cookies) — chỉ dùng cho chẩn đoán
         opts["logger"] = cap
         info = await asyncio.wait_for(loop.run_in_executor(None, _extract_sync, opts, video_url), timeout=15.0)
     except Exception as exc:  # noqa: BLE001
@@ -1229,7 +1237,8 @@ async def _diagnose_failure(video_url: str, loop: asyncio.AbstractEventLoop) -> 
     avail, age, live = info.get("availability"), info.get("age_limit"), info.get("live_status")
     warn = " / ".join(m.replace("\n", " ")[:140] for m in cap.msgs[:3])
     summary = (f"availability={avail} age_limit={age} live_status={live} formats={len(fmts)} có_url={n_url} "
-               f"có_audio={n_audio} | pot={pot} | warn={warn or '-'} | MEM {_mem.snapshot()}")
+               f"có_audio={n_audio} | pot={pot} | warn={warn or '-'} | MEM {_mem.snapshot()}"
+               f" | dbg={' ‖ '.join(cap.dbg) or '-'}")
     deno_failed = any("n challenge solving failed" in m or "returncode: -9" in m for m in cap.msgs)
     hint = ""
     if deno_failed and n_audio == 0:
