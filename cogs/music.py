@@ -1360,8 +1360,13 @@ async def _resolve_stream(
         if strat["name"] in skip_names:
             continue
         if strat.get("heavy") and (_mem.pressure() or 0.0) >= 0.65:
-            logger.info("RESOLVE | bỏ qua [%s]: RAM cgroup ≥ 65%%", strat["name"])
-            continue
+            try:   # cuộc đua proxy + yt-dlp để lại nhiều RAM (log: cgroup 48% → 80%) → trả bớt rồi đo lại
+                await asyncio.wait_for(loop.run_in_executor(None, _mem.relieve), timeout=5.0)
+            except Exception:  # noqa: BLE001
+                pass
+            if (_mem.pressure() or 0.0) >= 0.65:
+                logger.info("RESOLVE | bỏ qua [%s]: RAM cgroup ≥ 65%%", strat["name"])
+                continue
         if i and time.monotonic() - t_start > _RESOLVE_TOTAL_BUDGET:
             logger.warning("RESOLVE | quá %.0fs, dừng thử thêm chiến lược", _RESOLVE_TOTAL_BUDGET)
             break
@@ -1686,6 +1691,53 @@ async def _yt_oembed_title(video_url: str) -> str:
     return ""
 
 
+_ALT_UPLOAD_ENABLED = os.environ.get("ALT_UPLOAD", "1") != "0"
+
+
+async def _alt_upload_resolve(
+    title: str, duration: int | float | None, bad_id: str, loop: asyncio.AbstractEventLoop,
+) -> dict[str, Any] | None:
+    """
+    Khi MỌI chiến lược YouTube fail với 1 video: bot-check ở đây có vẻ theo TỪNG video (log 21/11: visionos
+    thắng ~1.1s ở hầu hết video, chỉ vài bản "1 HOUR" bị chặn ở mọi IP/proxy/cookies). Tìm bản upload KHÁC của
+    cùng bài (cùng tiêu đề + độ dài ±6%) rồi thử riêng visionos (~1s, không cookies/proxy) tối đa 2 ứng viên.
+    Rẻ hơn và đúng bài hơn SoundCloud. Tắt bằng biến môi trường ALT_UPLOAD=0.
+    """
+    if not _ALT_UPLOAD_ENABLED or not title:
+        return None
+    t0 = time.monotonic()
+    try:
+        q = " ".join(_title_tokens(title))[:80] or title[:80]
+        s_opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "socket_timeout": 8,
+                  "default_search": "ytsearch"}
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, _extract_sync, s_opts, f"ytsearch8:{q}"), timeout=8.0)
+        entries = [e for e in (info.get("entries") or []) if e and e.get("id") and e.get("id") != bad_id]
+        for e in entries:
+            e["url"] = f"https://www.youtube.com/watch?v={e['id']}"
+        tried = 0
+        while entries and tried < 2 and time.monotonic() - t0 < 10.0:
+            pick = _sc_pick(entries, title, duration)
+            if not pick:
+                break
+            entries = [e for e in entries if e is not pick]
+            tried += 1
+            opts = _ytdl_opts(False, use_proxy=False)
+            opts["extractor_args"]["youtube"] = {"player_client": ["visionos"], "skip": ["translated_subs", "comments"]}
+            try:
+                data = await asyncio.wait_for(_extract_verified(opts, pick["url"], loop), timeout=8.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("ALT UPLOAD | %s fail: %s", pick["id"], str(exc)[:60].replace("\n", " "))
+                continue
+            logger.info("ALT UPLOAD OK | %s → '%s' (%s) %.1fs", bad_id, str(data.get("title"))[:50],
+                        pick["id"], time.monotonic() - t0)
+            return data
+        logger.info("ALT UPLOAD | không có bản thay thế khớp cho '%s'", title[:60])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ALT UPLOAD lỗi: %s", str(exc)[:100])
+    return None
+
+
 async def _soundcloud_resolve(
     title: str, duration: int | float | None, loop: asyncio.AbstractEventLoop,
 ) -> dict[str, Any] | None:
@@ -1861,6 +1913,11 @@ class Track:
             # (2) SoundCloud: đúng bài + đúng độ dài thì phát luôn, người dùng khỏi phải thử lại.
             meta = {**_diag_meta.pop(video_url, {}), **{k: v for k, v in yt_meta.items() if v}}
             sc_title = meta.get("title") or await _yt_oembed_title(video_url)
+            _bad = re.search(r"(?:v=|/)([\w-]{11})(?:[&?/]|$)", video_url)
+            alt_data = await _alt_upload_resolve(sc_title, meta.get("duration"), _bad.group(1) if _bad else "", loop)
+            if alt_data:
+                _resolve_cache_put(video_url, alt_data, False, None)
+                return cls(alt_data, requester, via_proxy=False)
             sc_data = await _soundcloud_resolve(sc_title, meta.get("duration"), loop)
             if sc_data:
                 _resolve_cache_put(video_url, sc_data, False, None)

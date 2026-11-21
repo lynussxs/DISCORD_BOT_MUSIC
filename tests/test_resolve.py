@@ -469,3 +469,47 @@ def test_heavy_strategy_skipped_under_memory_pressure(monkeypatch):
         return await m._resolve_stream("https://www.youtube.com/watch?v=" + "h" * 11, asyncio.get_running_loop())
     run(go())
     assert ["web_safari"] not in seen and ["tv"] in seen
+
+
+# ── Bản upload thay thế khi video bị bot-check ở mọi chiến lược ────────────────────────────────
+def test_alt_upload_skips_bad_id_and_tries_next_candidate(monkeypatch):
+    tried = []
+    def fake_extract(opts, url):
+        if url.startswith("ytsearch8:"):
+            return {"entries": [
+                {"id": "BAD" + "0" * 8, "title": "X-COOL (1HOUR) tienanh109", "duration": 3600, "uploader": "a"},
+                {"id": "A" * 11, "title": "X-COOL 1HOUR tienanh109 hailong140", "duration": 3610, "uploader": "b"},
+                {"id": "B" * 11, "title": "X-COOL 1HOUR tienanh109 hailong140 HDN", "duration": 3598, "uploader": "c"},
+                {"id": "C" * 11, "title": "Another thing entirely", "duration": 3600, "uploader": "d"},
+            ]}
+        tried.append((url[-11:], opts["extractor_args"]["youtube"]["player_client"]))
+        if url.endswith("A" * 11):
+            raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot.")
+        return {"url": "https://x/hls.m3u8", "title": "ok", "id": "B" * 11}
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    async def go():
+        return await m._alt_upload_resolve("X-COOL (1HOUR) - tienanh109,hailong140,HDN", 3600, "BAD" + "0" * 8,
+                                           asyncio.get_running_loop())
+    d = run(go())
+    assert d and d["id"] == "B" * 11
+    assert all(c == ["visionos"] for _, c in tried) and not any(u.startswith("BAD") for u, _ in tried)
+
+
+def test_alt_upload_none_when_nothing_matches_or_disabled(monkeypatch):
+    monkeypatch.setattr(m, "_extract_sync", lambda o, u: {"entries": [{"id": "D" * 11, "title": "zzz qqq", "duration": 50}]})
+    async def go(): return await m._alt_upload_resolve("Charlie Puth Attention", 208, "x" * 11, asyncio.get_running_loop())
+    assert run(go()) is None
+    monkeypatch.setattr(m, "_ALT_UPLOAD_ENABLED", False)
+    assert run(go()) is None
+
+
+def test_from_query_uses_alt_upload_before_soundcloud(monkeypatch):
+    seen = _patch_all_yt_fail(monkeypatch, sc_entries=[E("Charlie Puth - Attention", 208, "Charlie Puth")],
+                              sc_stream={"url": "https://x/a.mp3", "title": "t", "duration": 208, "id": "1"})
+    async def fake_alt(title, dur, bad, loop):
+        return {"url": "https://x/alt.m3u8", "title": "Charlie Puth - Attention", "duration": 208, "id": "ALTALTALTAL"}
+    monkeypatch.setattr(m, "_alt_upload_resolve", fake_alt)
+    async def go():
+        return await m.Track.from_query("https://youtu.be/" + "z" * 11, FakeUser(), asyncio.get_running_loop())
+    t = run(go())
+    assert t.url.endswith("alt.m3u8") and not seen["sc"]       # chưa cần tới SoundCloud
