@@ -1364,66 +1364,6 @@ async def _proxy_race(
     raise last or RuntimeError("không có proxy khả dụng")
 
 
-# ── Đua direct: vision + web cùng lúc (hedged) ────────────────────────────────
-# Người dùng quan sát: 'web' (cookies + PO-Token) có đợt lấy bài ~4s ngon, trong khi 'vision' (~1s)
-# hay dính bot-check. Thay vì vision → (proxy ~6s) → web muộn, chạy 'web' NGAY khi vision fail
-# (hoặc sau RACE_WEB_DELAY giây nếu vision chưa xong) và lấy kết quả nào về trước. Vision thắng
-# nhanh (~1.1s) thì web không bao giờ khởi động → không tốn RAM Deno/bgutil (+50-80MB).
-# RACE_DIRECT=0 để tắt; RACE_WEB_DELAY=0 để đua hoàn toàn song song (nhanh nhất, tốn RAM nhất).
-_RACE_DIRECT    = os.environ.get("RACE_DIRECT", "1").strip() != "0"
-_RACE_WEB_DELAY = float(os.environ.get("RACE_WEB_DELAY", "1.3") or 0)
-_RACE_MEM_MAX   = 0.60    # cgroup ≥ 60% → không đua (chỉ chạy vision như cũ)
-_RACE_NAMES     = ("vision", "web")
-
-
-async def _race_direct(
-    video_url: str, loop: asyncio.AbstractEventLoop,
-) -> tuple[tuple[dict[str, Any], str] | None, dict[str, Exception]]:
-    """Trả ((data, tên_chiến_lược), {}) nếu có người thắng; (None, {tên: lỗi}) nếu cả hai fail."""
-    by_name = {s["name"]: s for s in _YT_STRATEGIES}
-
-    async def one(name: str) -> tuple[str, dict[str, Any] | None, Exception | None]:
-        strat = by_name[name]
-        opts = _ytdl_opts(strat["cookies"], use_proxy=False)
-        opts["extractor_args"]["youtube"] = {"player_client": strat["clients"],
-                                             "skip": ["translated_subs", "comments"]}
-        try:
-            data = await asyncio.wait_for(_extract_verified(opts, video_url, loop),
-                                          timeout=_RESOLVE_ATTEMPT_TIMEOUT)
-            return name, data, None
-        except asyncio.TimeoutError:
-            return name, None, RuntimeError(f"yt-dlp timeout sau {_RESOLVE_ATTEMPT_TIMEOUT:.0f}s ({name})")
-        except Exception as e:  # noqa: BLE001
-            return name, None, e
-
-    first = asyncio.ensure_future(one("vision"))
-    tasks: dict[str, "asyncio.Future[Any]"] = {"vision": first}
-    errors: dict[str, Exception] = {}
-    try:
-        # web khởi động khi vision xong (fail) hoặc sau RACE_WEB_DELAY giây — cái nào đến trước
-        await asyncio.wait({first}, timeout=_RACE_WEB_DELAY)
-        if first.done():
-            name, data, err = first.result()
-            if data is not None:
-                return (data, name), {}
-            errors[name] = err  # type: ignore[assignment]
-            tasks.pop("vision")
-        tasks["web"] = asyncio.ensure_future(one("web"))
-        pending = set(tasks.values())
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
-                name, data, err = t.result()
-                if data is not None:
-                    return (data, name), {}
-                errors[name] = err  # type: ignore[assignment]
-        return None, errors
-    finally:
-        for t in tasks.values():
-            if not t.done():
-                t.cancel()   # thread yt-dlp đang chạy vẫn xong nốt nhưng kết quả bị bỏ
-
-
 async def _resolve_stream(
     video_url: str, loop: asyncio.AbstractEventLoop,
 ) -> tuple[dict[str, Any] | None, str | None, Exception | None]:
@@ -1454,35 +1394,6 @@ async def _resolve_stream(
             escalated = True
             logger.info("RESOLVE | direct bị bot-check %d bài liên tiếp → đi thẳng proxy (thăm dò direct lại sau %.0fs)",
                         _breaker._direct_bc, _breaker.DIRECT_REPROBE)
-
-    # Đua vision + web (xem _race_direct). Chỉ khi cả hai còn sống trong breaker, RAM cgroup < 60%,
-    # direct chưa bị bot-check liên tiếp (khi đó đi thẳng proxy như trên).
-    if (_RACE_DIRECT and not escalated and not any(_breaker.tripped(n) for n in _RACE_NAMES)
-            and (_mem.pressure() or 0.0) < _RACE_MEM_MAX):
-        t_r = time.monotonic()
-        won, errs = await _race_direct(video_url, loop)
-        if won is not None:
-            data, wname = won
-            _breaker.ok(wname)
-            _breaker.note_direct(False)
-            logger.info("RESOLVE OK | [%s] %.1fs (đua vision+web) | %s", wname, time.monotonic() - t_r, _win_info(data))
-            return data, None, None
-        for _n, _e in errs.items():
-            _low = str(_e).lower()
-            if any(x in _low for x in _UNAVAILABLE_MARKERS) and "format" not in _low:
-                raise _e
-        skip_names.update(errs)
-        pending_fails.extend(errs)
-        last_err = next(iter(errs.values()), None)
-        bc = [e for e in errs.values() if "sign in to confirm" in str(e).lower()]
-        logger.info("RESOLVE | đua vision+web đều fail sau %.1fs: %s", time.monotonic() - t_r,
-                    " | ".join(f"{k}: {str(v)[:50]}" for k, v in errs.items()).replace("\n", " "))
-        if bc:
-            bot_err = bc[0]
-            _breaker.note_direct(True)
-            _pr = [s for s in plan if s["proxy"]]
-            plan = _pr + [s for s in plan if not s["proxy"]]
-            escalated = True
 
     i = -1
     while i + 1 < len(plan):
