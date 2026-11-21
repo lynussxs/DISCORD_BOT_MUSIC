@@ -337,9 +337,15 @@ def _ffmpeg_before(
     no_proxy: bool = False,
     proxy_override: str | None = None,
     headers: dict[str, str] | None = None,
+    hls: bool = False,
 ) -> str:
     """
     FFmpeg input options cho YouTube stream.
+
+    hls=True (URL .m3u8, vd client visionos): BỎ -reconnect_at_eof/-reconnect_streamed. Playlist HLS
+    đọc tới EOF là bình thường, nhưng với 2 flag này ffmpeg "reconnect" vào chính EOF đó và ngủ
+    backoff 0s/1s/0s/1s cho MỖI playlist (log: "Will reconnect at 44516 in 0/1 second(s)") →
+    đầu bài trễ thêm ~2-3s. Đo bằng ffmpeg 6.1 + server HLS giả: 3.05s → 0.05s tới frame đầu.
     KHÔNG dùng -fflags +nobuffer hay -flags low_delay — gây crash/giật.
     KHÔNG dùng -timeout — không hỗ trợ trên mọi build FFmpeg.
 
@@ -371,11 +377,11 @@ def _ffmpeg_before(
     base = (
         "-tls_verify 0 "
         "-reconnect 1 "
-        "-reconnect_streamed 1 "
+        + ("" if hls else "-reconnect_streamed 1 ") +
         "-reconnect_delay_max 2 "         # giảm từ 5s→2s: rút ngắn thời gian "đứng
                                            # hình" tối đa mỗi lần ffmpeg tự dò kết nối
                                            # lại gần cuối bài (reconnect_at_eof)
-        "-reconnect_at_eof 1 "
+        + ("" if hls else "-reconnect_at_eof 1 ") +
         "-reconnect_on_network_error 1 "
         "-reconnect_on_http_error 5xx "   # chỉ retry 5xx, KHÔNG retry 4xx (403 = cần URL mới)
         # ĐÃ THỬ "-limit_rate 3M" nhưng KHÔNG PHẢI flag hợp lệ của ffmpeg
@@ -399,6 +405,11 @@ def _ffmpeg_before(
         if proxy:
             base += f" -http_proxy {proxy}"
     return base
+
+def _is_hls(url: str | None) -> bool:
+    u = (url or "").lower()
+    return ".m3u8" in u or "hls_playlist" in u or "/hls" in u
+
 
 # Matches http:// and https:// URLs so we can detect non-URL queries.
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -967,11 +978,15 @@ _YT_STRATEGIES: list[dict[str, Any]] = [
     #    còn storyboard → "Requested format is not available"; các client TV vẫn trả link thẳng.
     #  • Client có hỗ trợ cookies mà gửi kèm cookies thì client KHÔNG hỗ trợ (visionos, android_vr,
     #    ios) bị yt-dlp bỏ qua → tách riêng strategy có cookies / không cookies.
-    {"name": "samsung_ck", "clients": ["tv_samsung"],                    "cookies": True,  "proxy": False},
-    {"name": "web",        "clients": ["web", "mweb"],                    "cookies": True,  "proxy": False},
+    # THỨ TỰ THEO LOG 21/11 (6 bài liên tiếp): chỉ 'vision' thắng (~1.1s, không cookies/PO-Token/Deno);
+    # samsung_ck & web luôn dính SABR ("Requested format is not available") và 'web' còn làm
+    # bgutil-pot 17→69MB + python +30MB. → vision ĐẦU TIÊN; cookies-client chỉ là dự phòng
+    # (video giới hạn tuổi cần đăng nhập).
     {"name": "vision",     "clients": ["visionos"],                       "cookies": False, "proxy": False},
+    {"name": "samsung_ck", "clients": ["tv_samsung"],                    "cookies": True,  "proxy": False},
     {"name": "embed_vr",   "clients": ["web_embedded", "android_vr"],     "cookies": False, "proxy": False},
     {"name": "tv_dg_ck",   "clients": ["tv_downgraded"],                  "cookies": True,  "proxy": False},
+    {"name": "web",        "clients": ["web", "mweb"],                    "cookies": True,  "proxy": False},
     {"name": "web_nock",   "clients": ["web", "mweb"],                    "cookies": False, "proxy": False},
     {"name": "proxy",      "clients": ["tv_samsung", "visionos", "web_embedded", "android_vr"], "cookies": False, "proxy": True},
 ]
@@ -1021,6 +1036,19 @@ class _YtHealth:
 
 
 _yt_health = _YtHealth()
+_last_trim = 0.0
+
+
+async def _trim_memory_soon(loop: asyncio.AbstractEventLoop) -> None:
+    """gc + malloc_trim sau resolve (yt-dlp để lại nhiều object; python 99→142MB sau 5 bài). Tối đa 1 lần/60s."""
+    global _last_trim
+    if time.monotonic() - _last_trim < 60.0:
+        return
+    _last_trim = time.monotonic()
+    try:
+        await loop.run_in_executor(None, _mem.relieve)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class _StrategyBreaker:
@@ -1610,6 +1638,7 @@ class Track:
         resolved_via_proxy = bool(resolved_proxy_str)
         if data is not None:
             _yt_health.ok()
+            asyncio.ensure_future(_trim_memory_soon(loop))
 
         if data is None:
             _yt_health.fail()
@@ -1774,7 +1803,7 @@ class Track:
                 logger.info("Dùng Piped stream cho '%s' — tránh proxy jitter", self.title)
                 pcm = _new_pcm(
                     piped_data["url"],
-                    _ffmpeg_before(no_proxy=True),
+                    _ffmpeg_before(no_proxy=True, hls=_is_hls(piped_data["url"])),
                     opts,
                 )
                 return await self._wrap_source(pcm, safe_vol, via_proxy=False)
@@ -1783,10 +1812,40 @@ class Track:
             self.url,
             _ffmpeg_before(seek=seek, no_proxy=not self._url_via_proxy,
                            proxy_override=self._proxy_used,
-                           headers=self.http_headers),
+                           headers=self.http_headers, hls=_is_hls(self.url)),
             opts,
         )
         return await self._wrap_source(pcm, safe_vol, via_proxy=self._url_via_proxy)
+
+    # ── Prewarm: chạy ffmpeg + đệm trong lúc bot đang nối voice (~2-3s) ─────────────
+    def start_prewarm(self, volume: float) -> None:
+        if getattr(self, "_pre_task", None) is not None:
+            return
+        self._pre_task = asyncio.ensure_future(self.make_source(volume))
+        asyncio.get_running_loop().call_later(60.0, self.discard_prewarm)   # không ai lấy → dọn, khỏi rò ffmpeg
+
+    def discard_prewarm(self) -> None:
+        t = getattr(self, "_pre_task", None)
+        self._pre_task = None
+        if t is None:
+            return
+        if t.done():
+            if not t.cancelled() and t.exception() is None:
+                try:
+                    t.result().cleanup()
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            t.cancel()
+
+    async def take_source(self, volume: float) -> "discord.PCMVolumeTransformer":
+        t = getattr(self, "_pre_task", None)
+        self._pre_task = None
+        if t is None:
+            return await self.make_source(volume)
+        src = await t                      # lỗi của prewarm (vd SC im lặng) vẫn nổi lên như make_source
+        src.volume = volume                # volume có thể đã đổi trong lúc chờ
+        return src
 
     async def _wrap_source(self, pcm: "discord.FFmpegPCMAudio", volume: float,
                            via_proxy: bool) -> "_CountingSource":
@@ -2442,7 +2501,7 @@ class GuildPlayer:
 
                 # ── Create audio source ────────────────────────────────────────
                 try:
-                    source = await track.make_source(self.volume)
+                    source = await track.take_source(self.volume)
                     self._current_source = source  # cho set_volume() chỉnh live
                     # make_source() có thể mất vài giây (chờ prebuffer) → tính giờ bài
                     # từ lúc THỰC SỰ bắt đầu phát, nếu không progress bar chạy lố.
@@ -3037,9 +3096,17 @@ class Music(commands.Cog):
             if _existing_player:
                 _existing_player.pending_resolves = max(0, _existing_player.pending_resolves - 1)
 
+        # Resolve thành công → khởi động ffmpeg + đệm NGAY (song song với nối voice ~2-3s) nếu bot đang
+        # rảnh; bài sẽ phát gần như tức thì khi voice xong. Không ai lấy trong 60s thì tự dọn.
+        _idle_now = (_existing_player is None) or not (
+            _existing_player.vc.is_playing() or _existing_player.vc.is_paused() or _existing_player.queue)
+        if _idle_now:
+            track.start_prewarm(_existing_player.volume if _existing_player else config.DEFAULT_VOLUME / 100)
+
         # Resolve thành công → giờ mới kết nối voice.
         voice_client = await self._ensure_voice(interaction)
         if voice_client is None:
+            track.discard_prewarm()
             return
 
         guild_id = interaction.guild_id
@@ -3081,6 +3148,7 @@ class Music(commands.Cog):
         )
 
         if position == -1:
+            track.discard_prewarm()
             await interaction.followup.send(
                 embed=discord.Embed(
                     title       = "⚠️ Trùng bài",
@@ -3679,7 +3747,8 @@ class Music(commands.Cog):
                 track.url,
                 before_options=_ffmpeg_before(seek=secs, no_proxy=not getattr(track, "_url_via_proxy", False),
                                                proxy_override=getattr(track, "_proxy_used", None),
-                                               headers=getattr(track, "http_headers", None)),
+                                               headers=getattr(track, "http_headers", None),
+                                               hls=_is_hls(track.url)),
                 options="-vn",
             )
             source = discord.PCMVolumeTransformer(pcm, volume=safe_vol)

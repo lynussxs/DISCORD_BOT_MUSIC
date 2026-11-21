@@ -57,7 +57,8 @@ def test_all_client_names_exist_in_installed_ytdlp():
 # ── Thứ tự chiến lược / breaker ────────────────────────────────────────────────
 def test_plan_default_order_and_single_proxy_attempt():
     names = [s["name"] for s in m._breaker.plan()]
-    assert names[0] == "samsung_ck"
+    assert names[0] == "vision"          # log 21/11: chỉ visionos thắng (không cookies/PO-Token/Deno)
+    assert names.index("web") > names.index("samsung_ck")   # web (SABR, tốn RAM) không đứng đầu
     assert names.count("proxy") == 1 and names[-1] == "proxy"
 
 
@@ -134,7 +135,7 @@ def test_resolve_stops_at_first_success(monkeypatch):
     data, proxy, err = run(go())
     assert data and err is None and proxy is None
     assert len(calls) == 3
-    assert calls[0] == ["tv_samsung"]                 # TV client (không cần PO-Token) thử đầu tiên
+    assert calls[0] == ["visionos"]                   # vision thử đầu tiên
     assert m._breaker.plan()[0]["name"] == [s["name"] for s in m._YT_STRATEGIES][2]  # người thắng được ưu tiên
 
 
@@ -266,3 +267,41 @@ def test_from_query_sc_first_skips_youtube_chain(monkeypatch):
     t = run(go())
     assert t.url.endswith("a.mp3") and yt_calls == []
     m._yt_health.__init__()
+
+
+# ── HLS: không dùng reconnect_at_eof/streamed (stall ~3s lúc mở playlist, đo bằng ffmpeg thật) ──
+def test_hls_drops_eof_reconnect_but_progressive_keeps_it():
+    hls = m._ffmpeg_before(no_proxy=True, hls=True)
+    prog = m._ffmpeg_before(no_proxy=True)
+    assert "reconnect_at_eof" not in hls and "reconnect_streamed" not in hls
+    assert "-reconnect 1" in hls and "reconnect_on_network_error" in hls
+    assert "-reconnect_at_eof 1" in prog and "-reconnect_streamed 1" in prog
+
+
+def test_is_hls():
+    assert m._is_hls("https://manifest.googlevideo.com/api/manifest/hls_playlist/id/x/index.m3u8")
+    assert not m._is_hls("https://rr1---sn.googlevideo.com/videoplayback?id=1")
+    assert not m._is_hls(None)
+
+
+# ── Prewarm: ffmpeg khởi động trước, take_source dùng lại; discard dọn sạch ─────
+def test_prewarm_is_reused_and_discarded(monkeypatch):
+    cleaned = []
+    class Src:
+        volume = 1.0
+        def cleanup(self): cleaned.append(1)
+    made = []
+    async def fake_make(self, volume, seek=0):
+        made.append(volume); return Src()
+    monkeypatch.setattr(m.Track, "make_source", fake_make)
+    t = m.Track.__new__(m.Track)
+    async def go():
+        t.start_prewarm(0.5); t.start_prewarm(0.5)        # gọi 2 lần chỉ tạo 1 nguồn
+        await asyncio.sleep(0)
+        src = await t.take_source(0.8)
+        assert src.volume == 0.8 and made == [0.5]
+        assert await t.take_source(0.3) is not None and made == [0.5, 0.3]   # không prewarm → tạo mới
+        t.start_prewarm(0.5); await asyncio.sleep(0.01)
+        t.discard_prewarm()
+        assert cleaned == [1]                               # nguồn dựng sẵn bị dọn, không rò ffmpeg
+    run(go())
