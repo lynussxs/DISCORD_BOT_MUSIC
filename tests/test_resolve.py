@@ -26,6 +26,7 @@ def _fresh(monkeypatch):
     m._search_cache.clear()
     m._diag_meta.clear()
     monkeypatch.setattr(m, "_cookies_valid", lambda: True)
+    monkeypatch.setattr(m, "_RACE_DIRECT", False)   # test cũ giả định thử tuần tự; test đua bật lại riêng
     yield
 
 
@@ -577,3 +578,77 @@ def test_resolve_goes_straight_to_proxy_when_direct_blocked(monkeypatch):
         return await m._resolve_stream("https://www.youtube.com/watch?v=" + "k" * 11, asyncio.get_running_loop())
     data, _, err = run(go())
     assert data and err is None and order == ["proxy"]
+
+
+# ── Đua vision + web (hedged) ──────────────────────────────────────────────────
+def _race_setup(monkeypatch, behaviours, delay=0.05):
+    """behaviours: {'vision': ('ok'|'bot'|'slow_ok', secs), 'web': (...)} — theo player_client đầu tiên."""
+    started = []
+
+    def fake_extract(opts, url):
+        c = opts["extractor_args"]["youtube"]["player_client"][0]
+        name = "vision" if c == "visionos" else "web" if c == "web" else c
+        started.append(name)
+        kind, secs = behaviours.get(name, ("bot", 0))
+        time.sleep(secs)
+        if kind == "bot":
+            raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you’re not a bot")
+        if kind == "fmt":
+            raise RuntimeError("ERROR: [youtube] x: Requested format is not available")
+        return {"url": f"https://rr.googlevideo.com/{name}", "title": name, "id": "x" * 11}
+
+    monkeypatch.setattr(m, "_RACE_DIRECT", True)
+    monkeypatch.setattr(m, "_RACE_WEB_DELAY", delay)
+    monkeypatch.setattr(m, "_extract_sync", fake_extract)
+    return started
+
+
+def _resolve(vid="r" * 11):
+    async def go():
+        return await m._resolve_stream("https://www.youtube.com/watch?v=" + vid, asyncio.get_running_loop())
+    return run(go())
+
+
+def test_race_vision_wins_fast_web_never_starts(monkeypatch):
+    started = _race_setup(monkeypatch, {"vision": ("ok", 0.0)}, delay=0.3)
+    data, proxy, err = _resolve()
+    assert data["title"] == "vision" and proxy is None and err is None
+    assert started == ["vision"]                       # web không khởi động → không tốn RAM
+
+
+def test_race_web_starts_as_soon_as_vision_botchecked(monkeypatch):
+    started = _race_setup(monkeypatch, {"vision": ("bot", 0.0), "web": ("ok", 0.05)}, delay=5.0)
+    t0 = time.monotonic()
+    data, proxy, err = _resolve()
+    assert data["title"] == "web" and proxy is None
+    assert started == ["vision", "web"]
+    assert time.monotonic() - t0 < 2.0                 # không phải chờ hết RACE_WEB_DELAY (5s)
+
+
+def test_race_web_overlaps_when_vision_is_slow(monkeypatch):
+    started = _race_setup(monkeypatch, {"vision": ("ok", 0.6), "web": ("ok", 0.02)}, delay=0.1)
+    data, _, _ = _resolve()
+    assert data["title"] == "web"                      # web về trước vision chậm
+    assert set(started) == {"vision", "web"}
+
+
+def test_race_both_botchecked_goes_straight_to_proxy(monkeypatch):
+    started = _race_setup(monkeypatch, {"vision": ("bot", 0.0), "web": ("bot", 0.0)})
+    order = []
+
+    async def fake_race(opts, url, loop, t0):
+        order.append("proxy")
+        return {"url": "https://x/p", "title": "p", "id": "x" * 11}
+
+    monkeypatch.setattr(m, "_proxy_race", fake_race)
+    data, _, err = _resolve("s" * 11)
+    assert data["title"] == "p" and order == ["proxy"]
+    assert started.count("vision") == 1 and started.count("web") == 1   # không thử lại direct
+    assert m._breaker._direct_bc == 1
+
+
+def test_race_skipped_when_memory_high(monkeypatch):
+    started = _race_setup(monkeypatch, {"vision": ("ok", 0.0)})
+    monkeypatch.setattr(m._mem, "pressure", lambda: 0.9)
+    data, _, _ = _resolve("t" * 11)
+    assert data["title"] == "vision" and started == ["vision"]
