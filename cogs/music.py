@@ -37,6 +37,7 @@ import re
 import threading
 import random
 import time
+import unicodedata
 from typing import Any
 
 import httpx as _httpx  # dùng cho Piped/Invidious fallback async calls
@@ -1834,7 +1835,10 @@ _diag_meta: dict[str, dict[str, Any]] = {}   # video_url → {title, duration, u
 
 
 def _title_tokens(text: str) -> list[str]:
-    return [t for t in re.findall(r"\w+", (text or "").lower()) if len(t) > 1 and t not in _SC_STOPWORDS]
+    # NFKC: chữ "kiểu" Unicode (𝐏𝒍𝒂𝒚𝒍𝒊𝒔𝒕, ｆｕｌｌｗｉｄｔｈ, ㊙…) về dạng thường — tên bài hay dùng kiểu này
+    # nên trước đây không bao giờ khớp được với tiêu đề SoundCloud.
+    text = unicodedata.normalize("NFKC", text or "").lower()
+    return [t for t in re.findall(r"\w+", text) if len(t) > 1 and t not in _SC_STOPWORDS]
 
 
 def _sc_pick(entries: list[dict[str, Any]], title: str, duration: int | float | None) -> dict[str, Any] | None:

@@ -636,3 +636,10 @@ def test_url_stays_fresh_for_queued_tracks():
     assert t.url_is_fresh                                  # không extract lần 2 lúc tới lượt
     t._url_fetched_at = time.monotonic() - 50 * 60
     assert not t.url_is_fresh
+
+
+def test_title_tokens_normalize_fancy_unicode():
+    assert m._title_tokens("𝐏𝒍𝒂𝒚𝒍𝒊𝒔𝒕 | 틱톡충들의 마음을") == ["playlist", "틱톡충들의", "마음을"]
+    assert m._title_tokens("ＣＨＡＲＬＩＥ ＰＵＴＨ") == ["charlie", "puth"]
+    e = [{"title": "Charlie Puth - Attention", "duration": 208, "uploader": "x", "url": "https://soundcloud.com/a"}]
+    assert m._sc_pick(e, "ℂ𝕙𝕒𝕣𝕝𝕚𝕖 ℙ𝕦𝕥𝕙 – 𝔸𝕥𝕥𝕖𝕟𝕥𝕚𝕠𝕟", 208) is e[0]
