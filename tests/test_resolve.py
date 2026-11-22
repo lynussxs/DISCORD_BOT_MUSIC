@@ -577,3 +577,62 @@ def test_resolve_goes_straight_to_proxy_when_direct_blocked(monkeypatch):
         return await m._resolve_stream("https://www.youtube.com/watch?v=" + "k" * 11, asyncio.get_running_loop())
     data, _, err = run(go())
     assert data and err is None and order == ["proxy"]
+
+
+# ── Nhẹ tay với YouTube: lùi theo cấp, cổng 1 extraction trực tiếp, URL tươi lâu hơn ──────────
+def test_direct_backoff_doubles_on_failed_reprobe_and_resets_on_success():
+    b = m._breaker
+    for _ in range(3):
+        b.note_direct(True)
+    assert b.skip_direct() and b._direct_window() == 300
+    b._direct_bc_at -= 301                      # hết hạn nghỉ → thăm dò lại, vẫn bị chặn
+    assert not b.skip_direct()
+    b.note_direct(True)
+    assert b._direct_window() == 600 and b.skip_direct()
+    for _ in range(6):                          # lùi tối đa 30 phút
+        b._direct_bc_at -= 100000
+        b.note_direct(True)
+    assert b._direct_window() == 1800
+    b.note_direct(False)
+    assert b._direct_window() == 300 and not b.skip_direct()
+
+
+def test_direct_gate_serializes_direct_extractions(monkeypatch):
+    active, peak = [0], [0]
+
+    async def fake_verified(opts, url, loop):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        await asyncio.sleep(0.05)
+        active[0] -= 1
+        return {"url": "u"}
+
+    monkeypatch.setattr(m, "_extract_verified", fake_verified)
+    monkeypatch.setattr(m, "_direct_gate", None)
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(*[m._extract_direct({}, "v", loop) for _ in range(4)])
+
+    run(go())
+    assert peak[0] == 1
+
+
+def test_single_direct_extraction_adds_no_delay(monkeypatch):
+    async def fake_verified(opts, url, loop):
+        return {"url": "u"}
+    monkeypatch.setattr(m, "_extract_verified", fake_verified)
+    monkeypatch.setattr(m, "_direct_gate", None)
+    async def go():
+        t0 = time.monotonic()
+        await m._extract_direct({}, "v", asyncio.get_running_loop())
+        return time.monotonic() - t0
+    assert run(go()) < 0.05
+
+
+def test_url_stays_fresh_for_queued_tracks():
+    t = m.Track({"title": "t", "url": "https://x/y.m3u8", "id": "x" * 11}, requester=None)
+    t._url_fetched_at = time.monotonic() - 20 * 60        # xếp hàng 20 phút trước
+    assert t.url_is_fresh                                  # không extract lần 2 lúc tới lượt
+    t._url_fetched_at = time.monotonic() - 50 * 60
+    assert not t.url_is_fresh

@@ -35,6 +35,7 @@ import json
 import os
 import re
 import threading
+import random
 import time
 from typing import Any
 
@@ -1162,7 +1163,7 @@ _YT_STRATEGIES: list[dict[str, Any]] = [
 _RESOLVE_ATTEMPT_TIMEOUT = 15.0   # tối đa cho 1 lần extract — tránh 1 attempt treo ăn hết thời gian
 _RESOLVE_TOTAL_BUDGET    = 25.0   # tổng thời gian tối đa cho mọi chiến lược của 1 bài
 _MEM_PRESSURE_HEAL       = 0.75   # cgroup dùng ≥ 75% giới hạn → coi là áp lực bộ nhớ
-_RESOLVE_CACHE_TTL       = 300.0
+_RESOLVE_CACHE_TTL       = 2700.0   # 45 phút (URL googlevideo sống ~6h: expire= trong URL)
 _RESOLVE_CACHE_MAX       = 64
 
 
@@ -1230,6 +1231,7 @@ class _StrategyBreaker:
         self._ok_at: dict[str, float] = {}
         self._direct_bc = 0          # số bài liên tiếp mà chiến lược trực tiếp bị bot-check
         self._direct_bc_at = 0.0
+        self._direct_level = 0       # mỗi lần thăm dò lại vẫn bị chặn → nghỉ lâu gấp đôi (tối đa 30 phút)
 
     # Khi IP Railway bị bot-check liên tiếp, bước thử vision (~1s) chỉ tốn thời gian rồi vẫn phải
     # sang proxy. Sau DIRECT_SKIP_AFTER bài liên tiếp → đi thẳng proxy; thăm dò lại direct sau
@@ -1237,16 +1239,25 @@ class _StrategyBreaker:
     DIRECT_SKIP_AFTER = 3
     DIRECT_REPROBE    = 300.0
 
+    def _direct_window(self) -> float:
+        return min(self.DIRECT_REPROBE * (2 ** self._direct_level), 1800.0)
+
     def note_direct(self, botcheck: bool) -> None:
         if botcheck:
+            # đang ở trạng thái "đã khoá" mà lần thăm dò sau thời hạn vẫn bị chặn → lùi dài hơn.
+            # Dồn thêm request vào IP đã bị đánh dấu thường chỉ kéo dài thời gian bị chặn.
+            if (self._direct_bc >= self.DIRECT_SKIP_AFTER
+                    and time.monotonic() - self._direct_bc_at >= self._direct_window()):
+                self._direct_level = min(self._direct_level + 1, 3)
             self._direct_bc += 1
             self._direct_bc_at = time.monotonic()
         else:
             self._direct_bc = 0
+            self._direct_level = 0
 
     def skip_direct(self) -> bool:
         return (self._direct_bc >= self.DIRECT_SKIP_AFTER
-                and time.monotonic() - self._direct_bc_at < self.DIRECT_REPROBE)
+                and time.monotonic() - self._direct_bc_at < self._direct_window())
 
     def ok(self, name: str) -> None:
         self._fails[name] = 0
@@ -1374,6 +1385,19 @@ def _probe_sync(data: dict[str, Any], proxy: str | None) -> bool:
         logger.warning("PROBE | HTTP %d cho client=%s (%s)", code, _url_client(url) or "?", "proxy" if proxy else "direct")
         return False
     return True
+
+
+_direct_gate: "asyncio.Semaphore | None" = None
+
+
+async def _extract_direct(opts: dict[str, Any], video_url: str, loop: asyncio.AbstractEventLoop) -> dict[str, Any]:
+    """_extract_verified nhưng chỉ 1 extraction TRỰC TIẾP (không proxy) chạy cùng lúc: nhiều /play dồn
+    dập từ cùng 1 IP là kiểu tải dễ bị bot-check/rate-limit nhất. Không thêm độ trễ khi chỉ có 1 yêu cầu."""
+    global _direct_gate
+    if _direct_gate is None:
+        _direct_gate = asyncio.Semaphore(1)
+    async with _direct_gate:
+        return await _extract_verified(opts, video_url, loop)
 
 
 async def _extract_verified(
@@ -1545,7 +1569,7 @@ async def _resolve_stream(
                 data = await _proxy_race(opts, video_url, loop, t_start)
             else:
                 data = await asyncio.wait_for(
-                    _extract_verified(opts, video_url, loop),
+                    _extract_direct(opts, video_url, loop),
                     timeout=_RESOLVE_ATTEMPT_TIMEOUT,
                 )
             _breaker.ok(strat["name"])
@@ -2129,7 +2153,9 @@ class Track:
     @property
     def url_is_fresh(self) -> bool:
         """URL stream còn hạn không (YouTube expire sau ~6 tiếng)."""
-        return (time.monotonic() - self._url_fetched_at) < 240  # 4 phút
+        # Trước đây 4 phút → mọi bài xếp hàng đều bị extract LẦN 2 lúc tới lượt phát (gấp đôi request tới
+        # YouTube, thêm nguy cơ bot-check). URL sống ~6h; 403 giữa chừng vẫn có nhánh refresh tự động.
+        return (time.monotonic() - self._url_fetched_at) < _RESOLVE_CACHE_TTL
 
     async def refresh_url(self, loop: asyncio.AbstractEventLoop, force: bool = False,
                           force_proxy: bool = False, force_itag18: bool = False) -> None:
@@ -2181,7 +2207,7 @@ class Track:
                     data = await _proxy_race(opts, self.webpage_url, loop, time.monotonic())
                 else:
                     data = await asyncio.wait_for(
-                        _extract_verified(opts, self.webpage_url, loop), timeout=_RESOLVE_ATTEMPT_TIMEOUT)
+                        _extract_direct(opts, self.webpage_url, loop), timeout=_RESOLVE_ATTEMPT_TIMEOUT)
                 new_url = data.get("url", "")
                 if new_url and "youtube.com/watch" not in new_url:
                     self.url = new_url
@@ -3260,6 +3286,10 @@ class GuildPlayer:
     async def _preload_next(self, track: Track) -> None:
         """Pre-load URL bài tiếp theo trong background."""
         try:
+            if track.url_is_fresh:                # URL còn mới (vừa resolve lúc xếp hàng) → khỏi gọi lại YouTube
+                self._preloaded = track
+                return
+            await asyncio.sleep(random.uniform(1.0, 2.5))   # nền → giãn nhịp, không làm chậm bài đang chờ
             await track.refresh_url(self._loop)
             self._preloaded = track
             logger.debug("Pre-loaded: '%s'", track.title)
