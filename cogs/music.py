@@ -964,6 +964,124 @@ class _CountingSource(discord.PCMVolumeTransformer):
         return data
 
 
+class _ChunkedHTTP:
+    """
+    File-like cho FFmpegPCMAudio(pipe=True): đọc URL googlevideo theo TỪNG KHÚC Range có giới hạn.
+
+    Vì sao: yt-dlp gắn http_chunk_size=10MiB cho mọi format https của YouTube và tự tải từng khúc
+    "Range: bytes=a-b". Log 21/11 (itag 18 của ANDROID_VR, URL không có pot=): probe Range 0-1 qua
+    (206) nhưng ffmpeg — luôn xin "Range: bytes=0-" mở đầu — bị 403 ngay request đầu, trên cả 3 IP
+    proxy khác nhau và URL mới → không phải lỗi IP/hết hạn. Đọc theo khúc giống downloader của yt-dlp.
+    403 → ghi đúng dòng "Server returned 403 Forbidden" vào stderr tạm để nhánh STREAM DROP refresh URL
+    như cũ; lỗi mạng tạm thời thử lại 2 lần.
+    """
+    SIZES = (256 << 10, 1 << 20, 4 << 20)      # khúc đầu nhỏ → ra tiếng nhanh, rồi tăng dần (≤ 10MiB của yt-dlp)
+
+    def __init__(self, url: str, headers: dict[str, str] | None, proxy: str | None, errf: Any = None) -> None:
+        import httpx
+        self._url = url
+        self._pos = 0
+        self._total: int | None = None
+        self._buf = bytearray()
+        self._eof = False
+        self._n = 0
+        self._errf = errf
+        self.failed = False
+        hdrs = {str(k): str(v) for k, v in (headers or {}).items() if k and v and str(k).lower() != "range"}
+        kw: dict[str, Any] = {"verify": False, "timeout": 15.0, "follow_redirects": True, "headers": hdrs}
+        try:
+            self._cli = httpx.Client(proxy=proxy, **kw) if proxy else httpx.Client(**kw)
+        except TypeError:                       # httpx cũ: tham số tên "proxies"
+            self._cli = httpx.Client(proxies=proxy, **kw) if proxy else httpx.Client(**kw)
+
+    def _say(self, msg: str) -> None:
+        logger.warning("CHUNKED | %s", msg)
+        try:
+            if self._errf is not None:
+                self._errf.write((msg + "\n").encode("utf-8", "ignore"))
+                self._errf.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _fetch(self) -> None:
+        size = self.SIZES[min(self._n, len(self.SIZES) - 1)]
+        start, end = self._pos, self._pos + size - 1
+        if self._total is not None:
+            end = min(end, self._total - 1)
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                r = self._cli.get(self._url, headers={"Range": f"bytes={start}-{end}"})
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                time.sleep(0.4)
+                continue
+            if r.status_code == 416:
+                self._eof = True
+                return
+            if r.status_code in (401, 403, 404, 410):
+                self.failed = True
+                self._say(f"Server returned {r.status_code} Forbidden (access denied)" if r.status_code == 403
+                          else f"Server returned {r.status_code}")
+                self._eof = True
+                return
+            if r.status_code not in (200, 206):
+                last = RuntimeError(f"HTTP {r.status_code}")
+                time.sleep(0.4)
+                continue
+            data = r.content
+            cr = r.headers.get("content-range", "")
+            if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+                self._total = int(cr.rsplit("/", 1)[1])
+            if r.status_code == 200:            # server bỏ qua Range → đã nhận toàn bộ từ đầu
+                self._total = len(data)
+                data = data[self._pos:]
+            self._buf += data
+            self._pos += len(data)
+            self._n += 1
+            if not data or (self._total is not None and self._pos >= self._total):
+                self._eof = True
+            return
+        self.failed = True
+        self._say(f"Connection error: {str(last)[:80]}")
+        self._eof = True
+
+    def read(self, n: int = 8192) -> bytes:
+        try:
+            while len(self._buf) < n and not self._eof:
+                self._fetch()
+        except Exception as exc:  # noqa: BLE001
+            self._say(f"Connection error: {str(exc)[:80]}")
+            self._eof = True
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def close(self) -> None:
+        try:
+            self._cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _ChunkedPCM(discord.FFmpegPCMAudio):
+    """FFmpegPCMAudio đọc từ _ChunkedHTTP; cleanup đóng luôn kết nối HTTP."""
+    _feeder: "_ChunkedHTTP | None" = None
+
+    def cleanup(self) -> None:
+        super().cleanup()
+        if self._feeder is not None:
+            self._feeder.close()
+
+
+def _new_pcm_chunked(feeder: "_ChunkedHTTP", before_options: str, options: str, errf: Any) -> "discord.FFmpegPCMAudio":
+    pcm = _ChunkedPCM(feeder, pipe=True, before_options="-loglevel warning " + before_options,
+                      options=options, stderr=errf)
+    pcm._feeder = feeder
+    pcm._err_file = errf  # type: ignore[attr-defined]
+    return pcm
+
+
 def _new_pcm(url: str, before_options: str, options: str) -> "discord.FFmpegPCMAudio":
     """
     Tạo FFmpegPCMAudio và GOM stderr của ffmpeg vào file tạm để ghi log khi bài
@@ -1196,7 +1314,7 @@ def _resolve_cache_get(video_url: str) -> tuple[dict[str, Any], bool, str | None
     return None
 
 
-_SLIM_KEYS = ("title", "url", "webpage_url", "thumbnail", "uploader", "channel", "duration", "id", "http_headers")
+_SLIM_KEYS = ("title", "url", "webpage_url", "thumbnail", "uploader", "channel", "duration", "id", "http_headers", "protocol")
 
 
 def _resolve_cache_put(video_url: str, data: dict[str, Any], via_proxy: bool, proxy: str | None) -> None:
@@ -1845,6 +1963,7 @@ class Track:
         # định dùng User-Agent generic của ffmpeg → CDN trả 403 dù URL còn hạn.
         # Lưu lại để truyền vào ffmpeg qua -headers ở make_source().
         self.http_headers: dict[str, str] = dict(data.get("http_headers") or {})
+        self.protocol: str = str(data.get("protocol") or "")
         self._url_fetched_at: float = time.monotonic()
         # QUAN TRỌNG: URL stream (googlevideo.com) bị khoá theo IP đã request nó.
         # Nếu resolve qua proxy nhưng ffmpeg lại stream trực tiếp (hoặc ngược lại)
@@ -2135,6 +2254,17 @@ class Track:
                 )
                 return await self._wrap_source(pcm, safe_vol, via_proxy=False)
 
+        if self.needs_chunked:
+            import tempfile
+            errf = tempfile.TemporaryFile()
+            feeder = _ChunkedHTTP(self.url, self.http_headers,
+                                  self._proxy_used if self._url_via_proxy else None, errf)
+            pre = (f"-ss {seek} " if seek > 0 else "") + "-analyzeduration 1000000 -probesize 96k"
+            logger.info("CHUNKED | '%s' đọc theo khúc (client=%s, thiếu pot=) thay vì ffmpeg mở thẳng URL",
+                        self.title[:40], _url_client(self.url) or "?")
+            pcm = _new_pcm_chunked(feeder, pre, opts, errf)
+            return await self._wrap_source(pcm, safe_vol, via_proxy=self._url_via_proxy)
+
         pcm = _new_pcm(
             self.url,
             _ffmpeg_before(seek=seek, no_proxy=not self._url_via_proxy,
@@ -2143,6 +2273,13 @@ class Track:
             opts,
         )
         return await self._wrap_source(pcm, safe_vol, via_proxy=self._url_via_proxy)
+
+    @property
+    def needs_chunked(self) -> bool:
+        """URL https googlevideo của client cần PO-Token nhưng không có pot= (vd ANDROID_VR itag 18):
+        ffmpeg mở thẳng bị 403, phải đọc theo khúc Range như yt-dlp. Mọi trường hợp khác giữ nguyên."""
+        return (os.environ.get("CHUNKED_READ", "1") != "0" and self.protocol == "https"
+                and "googlevideo.com" in self.url and _needs_probe({"url": self.url}))
 
     # ── Prewarm: chạy ffmpeg + đệm trong lúc bot đang nối voice (~2-3s) ─────────────
     def start_prewarm(self, volume: float) -> None:
