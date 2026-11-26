@@ -1161,8 +1161,11 @@ _YT_STRATEGIES: list[dict[str, Any]] = [
     {"name": "proxy",      "clients": ["tv_samsung", "visionos", "web_embedded", "android_vr"], "cookies": False, "proxy": True},
 ]
 
-_RESOLVE_ATTEMPT_TIMEOUT = 15.0   # tối đa cho 1 lần extract — tránh 1 attempt treo ăn hết thời gian
-_RESOLVE_TOTAL_BUDGET    = 25.0   # tổng thời gian tối đa cho mọi chiến lược của 1 bài
+# Host yếu (vd Render Free: 0.1 CPU) chạy yt-dlp chậm hơn nhiều → đặt RESOLVE_TIME_SCALE=2 (hoặc 3)
+# để các timeout dưới đây giãn ra tương ứng, tránh cắt ngang lần extract đang chạy bình thường.
+_TIME_SCALE = max(0.5, float(os.environ.get("RESOLVE_TIME_SCALE", "1") or 1))
+_RESOLVE_ATTEMPT_TIMEOUT = 15.0 * _TIME_SCALE   # tối đa cho 1 lần extract — tránh 1 attempt treo ăn hết thời gian
+_RESOLVE_TOTAL_BUDGET    = 25.0 * _TIME_SCALE   # tổng thời gian tối đa cho mọi chiến lược của 1 bài
 _MEM_PRESSURE_HEAL       = 0.75   # cgroup dùng ≥ 75% giới hạn → coi là áp lực bộ nhớ
 _RESOLVE_CACHE_TTL       = 2700.0   # 45 phút (URL googlevideo sống ~6h: expire= trong URL)
 _RESOLVE_CACHE_MAX       = 64
