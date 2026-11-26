@@ -32,9 +32,7 @@ httpx
 # Loads .env files into os.environ
 python-dotenv>=1.0.0
 
-# Lightweight web server used by keep_alive() so external ping services
-# (e.g. UptimeRobot) can hit an HTTP endpoint and keep the bot process alive.
-flask>=3.0.0
+# Keep-alive HTTP server dùng aiohttp (đã đi kèm discord.py) — không cần thêm thư viện.
 
 # ── System dependency (install separately) ────────────────────────────────────
 # FFmpeg is required for audio processing.

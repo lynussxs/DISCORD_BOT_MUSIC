@@ -31,81 +31,18 @@ import time
 from threading import Thread
 
 import discord
-from flask import Flask, jsonify
 from discord import app_commands
 from discord.ext import commands
 
 import config
 from utils.logger import setup_logging, get_logger
 
-# ── Silence Flask/Werkzeug startup noise ────────────────────────────────────
-logging.getLogger("werkzeug").setLevel(logging.ERROR)
-
 # ── Keep-alive web server ────────────────────────────────────────────────────
-# Flask serves health-check routes on the port Replit assigns via $PORT.
-# Cloud Run (autoscale) and Reserved VM both inject PORT and health-check it.
-# Using a single deterministic port (never a fallback loop) is required so
-# the startup probe gets a response before the promote-step timeout.
-
-_flask_app  = Flask(__name__)
+# Chạy bằng aiohttp ngay trên event loop của bot (utils/keepalive.py) — xem file đó.
 _start_time = time.time()
-
-# $PORT is set by Replit's deployment runtime (Cloud Run / VM).
-# Fall back to 8080 for local dev where PORT is not set.
-_PORT = int(os.environ.get("PORT", 8080))
 
 # Global bot reference — set in main() so health endpoints can inspect it.
 _bot_ref: "MusicBot | None" = None
-
-
-@_flask_app.route("/")
-def _index():
-    """Root route — must return 200 for Cloud Run startup probe to pass."""
-    return "Bot is alive!", 200
-
-
-@_flask_app.route("/health")
-def _health():
-    bot_ready = _bot_ref is not None and _bot_ref.is_ready()
-    uptime_s  = int(time.time() - _start_time)
-    h, rem    = divmod(uptime_s, 3600)
-    m, s      = divmod(rem, 60)
-    return jsonify({
-        "status": "online",
-        "bot":    "ready" if bot_ready else "starting",
-        "uptime": f"{h}h {m}m {s}s",
-    })
-
-
-@_flask_app.route("/ping")
-def _ping():
-    latency = round(_bot_ref.latency * 1000, 2) if (_bot_ref and _bot_ref.is_ready()) else 0
-    return jsonify({"pong": True, "latency_ms": latency})
-
-
-@_flask_app.route("/status")
-def _status():
-    bot_ready  = _bot_ref is not None and _bot_ref.is_ready()
-    uptime_s   = int(time.time() - _start_time)
-    guilds     = len(_bot_ref.guilds)      if bot_ready else 0
-    latency_ms = round(_bot_ref.latency * 1000, 2) if bot_ready else 0
-    return jsonify({
-        "status":      "online",
-        "bot_ready":   bot_ready,
-        "guild_count": guilds,
-        "latency_ms":  latency_ms,
-        "uptime_s":    uptime_s,
-    })
-
-
-def _run_flask() -> None:
-    """Bind Flask to 0.0.0.0:$PORT — single port, no fallback loop."""
-    _flask_app.run(host="0.0.0.0", port=_PORT, use_reloader=False)
-
-
-def keep_alive() -> None:
-    """Start the Flask keep-alive server on a background daemon thread."""
-    Thread(target=_run_flask, daemon=True).start()
 
 
 # ── PO-Token provider (bgutil) — chạy ngầm để yt-dlp vượt bot-check YouTube ──
@@ -444,7 +381,11 @@ class MusicBot(commands.Bot):
 async def main() -> None:
     global _bot_ref
     bot     = MusicBot()
-    _bot_ref = bot          # expose to Flask health endpoints
+    _bot_ref = bot          # expose to keep-alive health endpoints
+
+    # Mở cổng $PORT TRƯỚC khi đăng nhập Discord để Render thấy dịch vụ "live" ngay.
+    from utils import keepalive
+    await keepalive.start(lambda: _bot_ref)
 
     try:
         await bot.start(config.BOT_TOKEN)
@@ -466,6 +407,5 @@ if __name__ == "__main__":
     # Deno (n-challenge) bị OOM-kill ở container ~488MB: ép heap V8 nhỏ để nó GC sớm thay vì phình
     # tới trần cgroup. yt-dlp truyền nguyên env cho Deno. Ghi đè được bằng biến DENO_V8_FLAGS.
     os.environ.setdefault("DENO_V8_FLAGS", "--max-old-space-size=96,--max-semi-space-size=4")
-    keep_alive()
     start_bgutil_provider()
     asyncio.run(main())
