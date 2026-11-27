@@ -366,7 +366,7 @@ class MusicBot(commands.Bot):
             exc_info=True,
         )
 
-        msg = "An unexpected error occurred. Please try again."
+        msg = "❌  Đã xảy ra lỗi không mong muốn, hãy thử lại."
         try:
             if not interaction.response.is_done():
                 await interaction.response.send_message(msg, ephemeral=True)
@@ -382,6 +382,9 @@ async def main() -> None:
     global _bot_ref
     bot     = MusicBot()
     _bot_ref = bot          # expose to keep-alive health endpoints
+
+    from utils import autodelete
+    autodelete.install()    # mọi thông báo lỗi (❌) tự xoá sau 10s
 
     # Mở cổng $PORT TRƯỚC khi đăng nhập Discord để Render thấy dịch vụ "live" ngay.
     from utils import keepalive
