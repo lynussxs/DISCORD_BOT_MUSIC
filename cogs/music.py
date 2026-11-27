@@ -1185,7 +1185,8 @@ class _YtHealth:
     SoundCloud TRƯỚC (~2s); nếu SC không có thì mới chạy chuỗi YouTube. Cứ PROBE_EVERY giây lại
     thử YouTube trước 1 lần để biết khi nào nó sống lại (1 thành công → reset).
     """
-    DEAD_AFTER  = 2
+    # Host bị YouTube chặn từ đầu (vd Render Free) → đặt YT_DEAD_AFTER=1 (hoặc 0 = luôn SoundCloud trước).
+    DEAD_AFTER  = int(os.environ.get("YT_DEAD_AFTER", "2"))
     PROBE_EVERY = 600.0
 
     def __init__(self) -> None:
@@ -2103,20 +2104,28 @@ class Track:
             _yt_health.fail()
             # ── Mọi chiến lược YouTube đều fail ──
             # (1) Chẩn đoán (cũng lấy title/duration cho bước SoundCloud).
-            summary, hint = await _diagnose_failure(video_url, loop)
-            logger.warning("DIAG | %s | %s", video_url, summary)
+            # Đã biết title (từ bước search) thì KHÔNG chẩn đoán trước: log Render cho thấy bước này tốn
+            # ~10s mà chẳng ra gì; thử SoundCloud ngay, chỉ chẩn đoán nếu SC cũng không có.
+            have_title = bool({**_diag_meta.get(video_url, {}), **{k: v for k, v in yt_meta.items() if v}}.get("title"))
+            summary, hint = ("", "")
+            if not have_title:
+                summary, hint = await _diagnose_failure(video_url, loop)
+                logger.warning("DIAG | %s | %s", video_url, summary)
             # (2) SoundCloud: đúng bài + đúng độ dài thì phát luôn, người dùng khỏi phải thử lại.
             meta = {**_diag_meta.pop(video_url, {}), **{k: v for k, v in yt_meta.items() if v}}
             sc_title = meta.get("title") or await _yt_oembed_title(video_url)
             _bad = re.search(r"(?:v=|/)([\w-]{11})(?:[&?/]|$)", video_url)
+            sc_data = await _soundcloud_resolve(sc_title, meta.get("duration"), loop)   # ~2s, thử trước
+            if sc_data:
+                _resolve_cache_put(video_url, sc_data, False, None)
+                return cls(sc_data, requester, via_proxy=False)
             alt_data = await _alt_upload_resolve(sc_title, meta.get("duration"), _bad.group(1) if _bad else "", loop)
             if alt_data:
                 _resolve_cache_put(video_url, alt_data, False, None)
                 return cls(alt_data, requester, via_proxy=False)
-            sc_data = await _soundcloud_resolve(sc_title, meta.get("duration"), loop)
-            if sc_data:
-                _resolve_cache_put(video_url, sc_data, False, None)
-                return cls(sc_data, requester, via_proxy=False)
+            if have_title:
+                summary, hint = await _diagnose_failure(video_url, loop)
+                logger.warning("DIAG | %s | %s", video_url, summary)
             # (3) Piped/Invidious công khai gần như đã chết hoàn toàn (log 21/11: 404/500/502) →
             #     mặc định bỏ qua để khỏi tốn thêm ~8s; bật lại bằng PIPED_FALLBACK=1.
             vid_match = re.search(r"(?:v=|/)([\w-]{11})(?:[&?/]|$)", video_url)
