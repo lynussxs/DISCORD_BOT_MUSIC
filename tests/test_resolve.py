@@ -503,16 +503,25 @@ def test_alt_upload_none_when_nothing_matches_or_disabled(monkeypatch):
     assert run(go()) is None
 
 
-def test_from_query_uses_alt_upload_before_soundcloud(monkeypatch):
+def test_from_query_prefers_soundcloud_then_alt_upload(monkeypatch):
+    # Thứ tự hiện tại: SoundCloud (~2s) trước, bản upload YouTube khác (chậm, hay bị bot-check) sau.
     seen = _patch_all_yt_fail(monkeypatch, sc_entries=[E("Charlie Puth - Attention", 208, "Charlie Puth")],
                               sc_stream={"url": "https://x/a.mp3", "title": "t", "duration": 208, "id": "1"})
+    called = []
     async def fake_alt(title, dur, bad, loop):
+        called.append(1)
         return {"url": "https://x/alt.m3u8", "title": "Charlie Puth - Attention", "duration": 208, "id": "ALTALTALTAL"}
     monkeypatch.setattr(m, "_alt_upload_resolve", fake_alt)
     async def go():
         return await m.Track.from_query("https://youtu.be/" + "z" * 11, FakeUser(), asyncio.get_running_loop())
     t = run(go())
-    assert t.url.endswith("alt.m3u8") and not seen["sc"]       # chưa cần tới SoundCloud
+    assert t.url.endswith("a.mp3") and seen["sc"] and not called   # SC có kết quả → khỏi gọi alt-upload
+    # SC không có gì → rơi xuống alt-upload
+    seen2 = _patch_all_yt_fail(monkeypatch, sc_entries=[], sc_stream=None)
+    monkeypatch.setattr(m, "_alt_upload_resolve", fake_alt)
+    m._resolve_cache.clear()
+    t2 = run(go())
+    assert t2.url.endswith("alt.m3u8") and called
 
 
 # ── Nhớ proxy vừa thắng + working-set RAM (không tính page cache) ───────────────────────────────
